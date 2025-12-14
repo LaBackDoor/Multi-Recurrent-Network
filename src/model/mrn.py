@@ -24,13 +24,15 @@ class MRN(nn.Module):
         self,
         nn_structure: List[int],
         memory_structure: List[int],
-        device: Optional[torch.device] = None
+        device: Optional[torch.device] = None,
     ):
         super().__init__()
 
         self.nn_structure = nn_structure
         self.memory_structure = memory_structure
-        self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.device = device or torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
 
         # Convenience properties
         self.input_size = nn_structure[0]
@@ -41,7 +43,7 @@ class MRN(nn.Module):
         self.cell = MRNCell(
             nn_structure=nn_structure,
             memory_structure=memory_structure,
-            device=self.device
+            device=self.device,
         )
 
     def forward(
@@ -50,7 +52,7 @@ class MRN(nn.Module):
         states: Optional[MRNState] = None,
         return_sequences: bool = True,
         return_state: bool = False,
-        return_activations: bool = False
+        return_activations: bool = False,
     ) -> Tuple[torch.Tensor, ...]:
         """
         Process a sequence.
@@ -94,7 +96,9 @@ class MRN(nn.Module):
                 layer_activations_list[layer_index].append(activation)
 
         # Stack outputs
-        outputs_values = torch.stack(outputs_values, dim=1)  # [batch_size, seq_len, output_size]
+        outputs_values = torch.stack(
+            outputs_values, dim=1
+        )  # [batch_size, seq_len, output_size]
 
         # Stack all activations into a new dict
         all_layer_activations = {
@@ -104,11 +108,15 @@ class MRN(nn.Module):
 
         if squeeze_batch:
             outputs_values = outputs_values.squeeze(0)
-            all_layer_activations = {k: v.squeeze(0) for k, v in all_layer_activations.items()}
+            all_layer_activations = {
+                k: v.squeeze(0) for k, v in all_layer_activations.items()
+            }
 
         # Prepare return values
         if not return_sequences:
-            outputs_values = outputs_values[:, -1] if not squeeze_batch else outputs_values[-1]
+            outputs_values = (
+                outputs_values[:, -1] if not squeeze_batch else outputs_values[-1]
+            )
             all_layer_activations = {
                 k: (v[:, -1] if not squeeze_batch else v[-1])
                 for k, v in all_layer_activations.items()
@@ -144,6 +152,3 @@ class MRN(nn.Module):
             update: If True, memory will be updated; if False, memory stays frozen
         """
         self.cell._update_memory_flag = update
-
-
-

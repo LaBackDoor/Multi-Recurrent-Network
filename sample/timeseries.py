@@ -42,9 +42,7 @@ class TimeSeriesDataset(Dataset):
 
     def _create_sequences(self) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Create input-output sequences using sliding window.
-
-        Following the original numpy implementation:
+        Create input-output sequences using a sliding window.
         - Input: window_size timesteps starting at position i
         - Output: window_size timesteps starting at position i+horizon
 
@@ -54,11 +52,11 @@ class TimeSeriesDataset(Dataset):
 
         for i in range(len(self.data) - self.window_size - self.horizon + 1):
             # Input: window_size timesteps [i, i+window_size)
-            x.append(self.data[i:i + self.window_size])
+            x.append(self.data[i : i + self.window_size])
 
             # Output: window_size timesteps starting at i+horizon
             # [i+horizon, i+horizon+window_size)
-            y.append(self.data[i + self.horizon:i + self.horizon + self.window_size])
+            y.append(self.data[i + self.horizon : i + self.horizon + self.window_size])
 
         return np.array(x), np.array(y)
 
@@ -68,13 +66,13 @@ class TimeSeriesDataset(Dataset):
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         return (
             torch.FloatTensor(self.X[idx]).unsqueeze(-1),  # [window_size, 1]
-            torch.FloatTensor(self.y[idx])  # [window_size] - targets at each timestep
+            torch.FloatTensor(self.y[idx]),  # [window_size] - targets at each timestep
         )
 
 
-def load_data(csv_path: str, country: str = 'Afghanistan') -> np.ndarray:
+def load_data(csv_path: str, country: str = "Afghanistan") -> np.ndarray:
     """
-    Load COVID-19 data for country from CSV.
+    Load COVID-19 data for the country from CSV.
 
     Args:
         csv_path: Path to the COVID-19 CSV file
@@ -86,7 +84,7 @@ def load_data(csv_path: str, country: str = 'Afghanistan') -> np.ndarray:
     df = pd.read_csv(csv_path)
 
     # Filter Afghanistan row
-    data_row = df[df['Country/Region'] == country].iloc[0]
+    data_row = df[df["Country/Region"] == country].iloc[0]
 
     # Extract case data (skip first 4 columns: Province/State, Country/Region, Lat, Long)
     case_data = data_row.iloc[4:].values.astype(float)
@@ -104,8 +102,13 @@ def prepare_data(
     horizon: int,
     test_size: float = 0.15,
     val_size: float = 0.15,
-    use_minmax: bool = True
-) -> Tuple[TimeSeriesDataset, TimeSeriesDataset, TimeSeriesDataset, MinMaxScaler|StandardScaler]:
+    use_minmax: bool = True,
+) -> Tuple[
+    TimeSeriesDataset,
+    TimeSeriesDataset,
+    TimeSeriesDataset,
+    MinMaxScaler | StandardScaler,
+]:
     """
     Prepare data with train/val/test split and normalization.
 
@@ -169,18 +172,18 @@ def prepare_data(
 
 
 def train_epoch(
-        model: MRN,
-        data_loader: DataLoader,
-        criterion: nn.Module,
-        optimizer: torch.optim.Optimizer,
-        device: torch.device,
-        gradient_norm: float,
+    model: MRN,
+    data_loader: DataLoader,
+    criterion: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    gradient_norm: float,
 ) -> float:
     """
     Train for one epoch.
 
     - Process each timestep in the input sequence
-    - At each timestep i, predict the value at timestep i+horizon
+    - At each timestep I, predict the value at timestep i+horizon
     - Compute loss over ALL timesteps
     """
     model.train()
@@ -202,7 +205,7 @@ def train_epoch(
         outputs = outputs.squeeze(-1)  # [batch_size, window_size]
 
         # Compute loss over ALL timesteps
-        # outputs[:, i] should match batch_y[:, i]
+        # outputs[: i] should match batch_y[: i]
         # This means: at input timestep i, we predict the value horizon steps ahead
         loss = criterion(outputs, batch_y)
         loss.backward()
@@ -218,10 +221,7 @@ def train_epoch(
 
 
 def evaluate(
-        model: MRN,
-        data_loader: DataLoader,
-        criterion: nn.Module,
-        device: torch.device
+    model: MRN, data_loader: DataLoader, criterion: nn.Module, device: torch.device
 ) -> float:
     """Evaluate model on validation/test set."""
     model.eval()
@@ -232,11 +232,13 @@ def evaluate(
             batch_x = batch_x.to(device)
             batch_y = batch_y.to(device)
 
-            # Reset memory at start of each sequence
+            # Reset memory at the start of each sequence
             model.reset_memory()
 
             # Process input sequence - get outputs at all timesteps
-            outputs = model(batch_x, return_sequences=True)  # [batch_size, window_size, 1]
+            outputs = model(
+                batch_x, return_sequences=True
+            )  # [batch_size, window_size, 1]
             outputs = outputs.squeeze(-1)  # [batch_size, window_size]
 
             # Compute loss over all timesteps
@@ -256,7 +258,7 @@ def plot_results(
     scaler: StandardScaler,
     device: torch.device,
     save_path: str,
-    country: str
+    country: str,
 ):
     """
     Plot training curves and predictions.
@@ -264,22 +266,26 @@ def plot_results(
     fig, axes = plt.subplots(2, 1, figsize=(14, 10))
 
     # Plot 1: Training and validation loss
-    axes[0].plot(train_losses, label='Train Loss', linewidth=2)
-    axes[0].plot(val_losses, label='Validation Loss', linewidth=2)
-    axes[0].set_xlabel('Epoch', fontsize=12)
-    axes[0].set_ylabel('Loss (MSE)', fontsize=12)
-    axes[0].set_title(f'MRN Training Progress on {country} COVID-19 Data', fontsize=14, fontweight='bold')
+    axes[0].plot(train_losses, label="Train Loss", linewidth=2)
+    axes[0].plot(val_losses, label="Validation Loss", linewidth=2)
+    axes[0].set_xlabel("Epoch", fontsize=12)
+    axes[0].set_ylabel("Loss (MSE)", fontsize=12)
+    axes[0].set_title(
+        f"MRN Training Progress on {country} COVID-19 Data",
+        fontsize=14,
+        fontweight="bold",
+    )
     axes[0].legend(fontsize=10)
     axes[0].grid(True, alpha=0.3)
 
-    # Plot 2: Predictions vs Actual (full time series)
+    # Plot 2: Predictions vs. Actual (full-time series)
     model.eval()
 
     # Collect predictions for all datasets
     all_datasets = [
-        (train_dataset, 'train'),
-        (val_dataset, 'val'),
-        (test_dataset, 'test')
+        (train_dataset, "train"),
+        (val_dataset, "val"),
+        (test_dataset, "test"),
     ]
 
     all_predictions = []
@@ -305,8 +311,12 @@ def plot_results(
                 all_actuals.append(y[-1].item())
 
     # Inverse transform to original scale
-    predictions_original = scaler.inverse_transform(np.array(all_predictions).reshape(-1, 1)).flatten()
-    actuals_original = scaler.inverse_transform(np.array(all_actuals).reshape(-1, 1)).flatten()
+    predictions_original = scaler.inverse_transform(
+        np.array(all_predictions).reshape(-1, 1)
+    ).flatten()
+    actuals_original = scaler.inverse_transform(
+        np.array(all_actuals).reshape(-1, 1)
+    ).flatten()
 
     # Calculate split points
     train_end = len(train_dataset)
@@ -314,18 +324,48 @@ def plot_results(
 
     # Plot predictions vs actuals
     time_steps = np.arange(len(actuals_original))
-    axes[1].plot(time_steps, actuals_original, label='Actual Cases', linewidth=2, alpha=0.8, color='blue')
-    axes[1].plot(time_steps, predictions_original, label='Predicted Cases', linewidth=2, alpha=0.8,
-                 linestyle='--', color='orange')
+    axes[1].plot(
+        time_steps,
+        actuals_original,
+        label="Actual Cases",
+        linewidth=2,
+        alpha=0.8,
+        color="blue",
+    )
+    axes[1].plot(
+        time_steps,
+        predictions_original,
+        label="Predicted Cases",
+        linewidth=2,
+        alpha=0.8,
+        linestyle="--",
+        color="orange",
+    )
 
     # Add vertical lines to show train/val/test splits
-    axes[1].axvline(x=train_end, color='red', linestyle='--', linewidth=1.5, alpha=0.7, label='Train/Val Split')
-    axes[1].axvline(x=val_end, color='green', linestyle='--', linewidth=1.5, alpha=0.7, label='Val/Test Split')
+    axes[1].axvline(
+        x=train_end,
+        color="red",
+        linestyle="--",
+        linewidth=1.5,
+        alpha=0.7,
+        label="Train/Val Split",
+    )
+    axes[1].axvline(
+        x=val_end,
+        color="green",
+        linestyle="--",
+        linewidth=1.5,
+        alpha=0.7,
+        label="Val/Test Split",
+    )
 
-    axes[1].set_xlabel('Sequence Index', fontsize=12)
-    axes[1].set_ylabel('COVID-19 Cases', fontsize=12)
-    axes[1].set_title('Full Time Series: Predictions vs Actual', fontsize=14, fontweight='bold')
-    axes[1].legend(fontsize=10, loc='upper right')
+    axes[1].set_xlabel("Sequence Index", fontsize=12)
+    axes[1].set_ylabel("COVID-19 Cases", fontsize=12)
+    axes[1].set_title(
+        "Full Time Series: Predictions vs Actual", fontsize=14, fontweight="bold"
+    )
+    axes[1].legend(fontsize=10, loc="upper right")
     axes[1].grid(True, alpha=0.3)
 
     # Calculate metrics for each split
@@ -346,16 +386,23 @@ def plot_results(
 
     # Add metrics text
     metrics_text = (
-        f'Train RMSE: {train_rmse:.2f} | MAE: {train_mae:.2f}\n'
-        f'Val RMSE: {val_rmse:.2f} | MAE: {val_mae:.2f}\n'
-        f'Test RMSE: {test_rmse:.2f} | MAE: {test_mae:.2f}'
+        f"Train RMSE: {train_rmse:.2f} | MAE: {train_mae:.2f}\n"
+        f"Val RMSE: {val_rmse:.2f} | MAE: {val_mae:.2f}\n"
+        f"Test RMSE: {test_rmse:.2f} | MAE: {test_mae:.2f}"
     )
-    axes[1].text(0.02, 0.98, metrics_text, transform=axes[1].transAxes,
-                 verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8),
-                 fontsize=9, family='monospace')
+    axes[1].text(
+        0.02,
+        0.98,
+        metrics_text,
+        transform=axes[1].transAxes,
+        verticalalignment="top",
+        bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.8),
+        fontsize=9,
+        family="monospace",
+    )
 
     plt.tight_layout()
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
     print(f"\nPlot saved to: {save_path}")
 
     # Print final metrics
@@ -367,45 +414,78 @@ def plot_results(
 
 def main():
 
-    parser = argparse.ArgumentParser(description='Train MRN on COVID-19 Time Series')
+    parser = argparse.ArgumentParser(description="Train MRN on COVID-19 Time Series")
 
     # Data parameters
-    parser.add_argument('--csv_path', type=str, default='../data/time_series/c19.csv',
-                        help='Path to COVID-19 CSV file')
-    parser.add_argument('--country', type=str, default='Afghanistan', help='Country')
-    parser.add_argument('--window_size', type=int, default=14,
-                        help='Number of past days to use as input')
-    parser.add_argument('--horizon', type=int, default=7,
-                        help='Number of future days to predict')
-    parser.add_argument('--use_minmax', action='store_true', default=True,
-                        help='Use MinMaxScaler instead of StandardScaler')
+    parser.add_argument(
+        "--csv_path",
+        type=str,
+        default="../data/time_series/c19.csv",
+        help="Path to COVID-19 CSV file",
+    )
+    parser.add_argument("--country", type=str, default="Afghanistan", help="Country")
+    parser.add_argument(
+        "--window_size",
+        type=int,
+        default=14,
+        help="Number of past days to use as input",
+    )
+    parser.add_argument(
+        "--horizon", type=int, default=7, help="Number of future days to predict"
+    )
+    parser.add_argument(
+        "--use_minmax",
+        action="store_true",
+        default=True,
+        help="Use MinMaxScaler instead of StandardScaler",
+    )
 
     # Model parameters
-    parser.add_argument('--hidden_sizes', type=int, nargs='+', default=[16],
-                        help='Sizes of hidden layers')
-    parser.add_argument('--memory_structure', type=int, nargs='+', default=[4, 3, 2],
-                        help='Number of memory banks per layer')
+    parser.add_argument(
+        "--hidden_sizes",
+        type=int,
+        nargs="+",
+        default=[16, 32],
+        help="Sizes of hidden layers",
+    )
+    parser.add_argument(
+        "--memory_structure",
+        type=int,
+        nargs="+",
+        default=[4, 3, 2, 4],
+        help="Number of memory banks per layer",
+    )
 
     # Training parameters
-    parser.add_argument('--epochs', type=int, default=100,
-                        help='Number of training epochs')
-    parser.add_argument('--batch_size', type=int, default=32,
-                        help='Batch size for training')
-    parser.add_argument('--lr', type=float, default=0.001,
-                        help='Learning rate')
-    parser.add_argument('--test_size', type=float, default=0.15,
-                        help='Fraction of data for test set')
-    parser.add_argument('--val_size', type=float, default=0.15,
-                        help='Fraction of train data for validation')
+    parser.add_argument(
+        "--epochs", type=int, default=200, help="Number of training epochs"
+    )
+    parser.add_argument(
+        "--batch_size", type=int, default=32, help="Batch size for training"
+    )
+    parser.add_argument("--lr", type=float, default=0.001, help="Learning rate")
+    parser.add_argument(
+        "--test_size", type=float, default=0.15, help="Fraction of data for test set"
+    )
+    parser.add_argument(
+        "--val_size",
+        type=float,
+        default=0.15,
+        help="Fraction of train data for validation",
+    )
 
     # Output
-    parser.add_argument('--output_dir', type=str, default='../data/time_series/',
-                        help='Directory to save results')
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="../data/time_series/",
+        help="Directory to save results",
+    )
 
     args = parser.parse_args()
 
     # Set device
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
     # Load data
@@ -424,15 +504,17 @@ def main():
         horizon=args.horizon,
         test_size=args.test_size,
         val_size=args.val_size,
-        use_minmax=args.use_minmax
+        use_minmax=args.use_minmax,
     )
 
     # Create data_loaders
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, drop_last=True)
+    train_loader = DataLoader(
+        train_dataset, batch_size=args.batch_size, shuffle=True, drop_last=True
+    )
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
 
-    # Create MRN model
+    # Create an MRN model
     print("\n" + "=" * 70)
     print("Creating MRN Model")
     print("=" * 70)
@@ -442,24 +524,22 @@ def main():
     nn_structure = [1] + args.hidden_sizes + [1]
 
     model = MRN(
-        nn_structure=nn_structure,
-        memory_structure=args.memory_structure,
-        device=device
+        nn_structure=nn_structure, memory_structure=args.memory_structure, device=device
     ).to(device)
 
     # Initialize weights with Xavier/Glorot initialization
     def init_weights(m):
         if isinstance(m, nn.Linear) or isinstance(m, nn.Parameter):
-            if hasattr(m, 'weight'):
+            if hasattr(m, "weight"):
                 nn.init.xavier_uniform_(m.weight)
-            if hasattr(m, 'bias') and m.bias is not None:
+            if hasattr(m, "bias") and m.bias is not None:
                 nn.init.zeros_(m.bias)
 
     # Apply initialization to all parameters
     for name, param in model.named_parameters():
-        if 'weight' in name:
+        if "weight" in name:
             nn.init.xavier_uniform_(param)
-        elif 'bias' in name:
+        elif "bias" in name:
             nn.init.zeros_(param)
 
     init_weights(model)
@@ -474,7 +554,7 @@ def main():
 
     # Learning rate scheduler - reduce LR when validation loss plateaus
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=10, min_lr=1e-6
+        optimizer, mode="min", factor=0.5, patience=10, min_lr=1e-6
     )
 
     # Training loop
@@ -484,10 +564,12 @@ def main():
 
     train_losses = []
     val_losses = []
-    best_val_loss = float('inf')
+    best_val_loss = float("inf")
 
     for epoch in range(args.epochs):
-        train_loss = train_epoch(model, train_loader, criterion, optimizer, device, gradient_norm=1.0)
+        train_loss = train_epoch(
+            model, train_loader, criterion, optimizer, device, gradient_norm=1.0
+        )
         val_loss = evaluate(model, val_loader, criterion, device)
 
         train_losses.append(train_loss)
@@ -498,16 +580,18 @@ def main():
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            # Save best model
-            torch.save(model.state_dict(), Path(args.output_dir) / 'best_mrn_model.pth')
+            # Save the best model
+            torch.save(model.state_dict(), Path(args.output_dir) / "best_mrn_model.pth")
 
         if (epoch + 1) % 10 == 0 or epoch == 0:
-            print(f"Epoch [{epoch+1:3d}/{args.epochs}] | "
-                  f"Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f} | "
-                  f"LR: {optimizer.param_groups[0]['lr']:.2e}")
+            print(
+                f"Epoch [{epoch+1:3d}/{args.epochs}] | "
+                f"Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f} | "
+                f"LR: {optimizer.param_groups[0]['lr']:.2e}"
+            )
 
-    # Load best model for final evaluation
-    model.load_state_dict(torch.load(Path(args.output_dir) / 'best_mrn_model.pth'))
+    # Load the best model for final evaluation
+    model.load_state_dict(torch.load(Path(args.output_dir) / "best_mrn_model.pth"))
 
     # Final test evaluation
     test_loss = evaluate(model, test_loader, criterion, device)
@@ -526,8 +610,8 @@ def main():
         test_dataset,
         scaler,
         device,
-        str(Path(args.output_dir) / 'mrn_training_results.png'),
-        args.country
+        str(Path(args.output_dir) / "mrn_training_results.png"),
+        args.country,
     )
 
     print("\n" + "=" * 70)
@@ -535,5 +619,5 @@ def main():
     print("=" * 70)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

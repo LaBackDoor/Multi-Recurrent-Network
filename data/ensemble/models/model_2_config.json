@@ -1,0 +1,14 @@
+{
+  "nn_structure": [
+    1,
+    16,
+    32,
+    1
+  ],
+  "memory_structure": [
+    4,
+    3,
+    2,
+    0
+  ]
+}

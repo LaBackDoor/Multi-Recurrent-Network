@@ -89,6 +89,8 @@ class KANMemoryBank(nn.Module):
         learn_ratios: bool = False,
         ratio_input_size: Optional[int] = None,
         ratio_control_use_kan: bool = True,
+        # v2.4 custom ratios for surviving items after pruning
+        custom_ratios: Optional[torch.Tensor] = None,
         device: Optional[torch.device] = None,
     ):
         super().__init__()
@@ -151,6 +153,30 @@ class KANMemoryBank(nn.Module):
         else:
             self.rcu = None
 
+        # ---- inserted section: persist KAN config + register layer_link_ratios buffer ----
+        # Persist KAN config so shrink() can rebuild a new bank with matching params.
+        self._kan_grid_size = kan_grid_size
+        self._kan_spline_order = kan_spline_order
+        self._kan_enable_standalone_scale_spline = kan_enable_standalone_scale_spline
+        self._kan_base_activation = kan_base_activation
+        self._kan_use_layernorm = kan_use_layernorm
+        self._kan_grid_range = kan_grid_range
+        self._ratio_control_use_kan = ratio_control_use_kan
+
+        # Register layer_link_ratios buffer. Default: (i+1)/K, matching v1.
+        if custom_ratios is None:
+            ratios = torch.tensor(
+                [(i + 1) / num_items for i in range(num_items)], dtype=torch.float32
+            )
+        else:
+            if custom_ratios.shape != (num_items,):
+                raise ValueError(
+                    f"custom_ratios must have shape ({num_items},), got {tuple(custom_ratios.shape)}"
+                )
+            ratios = custom_ratios.detach().to(torch.float32).clone()
+        self.register_buffer("layer_link_ratios", ratios)
+        # ---- end inserted section ----
+
         self.to(self.device)
 
     def init_memory(self, batch_size: int) -> torch.Tensor:
@@ -211,13 +237,12 @@ class KANMemoryBank(nn.Module):
             new_memory: [B, num_items, layer_size]
         """
         if self.rcu is None:
-            parts = []
-            for i in range(self.num_items):
-                factor = (i + 1) / self.num_items
-                parts.append(factor * new_activation + (1.0 - factor) * memory[:, i, :])
-            return torch.stack(parts, dim=1)
+            # v1 path - now reads from buffer instead of computing (i+1)/K inline
+            ratios = self.layer_link_ratios.view(1, -1, 1).to(memory.device)  # [1, K, 1]
+            new_act_expanded = new_activation.unsqueeze(1).expand_as(memory)
+            return ratios * new_act_expanded + (1.0 - ratios) * memory
 
-        # v2 path: learned ratios
+        # v2 path: learned ratios (unchanged from before)
         if current_input is None:
             raise ValueError(
                 "learn_ratios=True requires current_input to be passed to "

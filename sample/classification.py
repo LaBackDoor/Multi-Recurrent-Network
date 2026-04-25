@@ -151,9 +151,6 @@ def train_epoch(
 
         optimizer.zero_grad()
 
-        # Reset memory at the start of each sequence
-        model.reset_memory()
-
         # Process sequence - we only want the FINAL output for classification
         # return_sequences=False gives us just the last timestep output
         outputs = model(batch_x, return_sequences=False)  # [batch_size, num_classes]
@@ -216,9 +213,6 @@ def evaluate(
         for batch_x, batch_y in data_loader:
             batch_x = batch_x.to(device)
             batch_y = batch_y.to(device)
-
-            # Reset memory
-            model.reset_memory()
 
             # Get final output
             outputs = model(

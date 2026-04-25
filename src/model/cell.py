@@ -1,7 +1,32 @@
 """
 Multi-Recurrent Neural Network (MRN) - Cell-Based Implementation
 
-BROADCAST DESIGN: All memory banks project to ALL hidden layers
+Changes vs previous version (see MRN_translation_audit_v2.md for rationale):
+
+1. Weight init now uses uniform(-weight_init_range, weight_init_range) with a
+   small default (0.01), matching the thesis ("weight initialisations are very
+   small") and the NumPy reference. Was: torch.rand, i.e. uniform(0, 1), which
+   saturated sigmoids at step 0.
+
+2. BPTT is no longer blocked. Memory is carried in the MRNState tuple with full
+   gradient connectivity, so autograd builds the temporal graph across timesteps.
+   Was: every memory read and every update activation was .detach()'d, which
+   truncated BPTT to 1 step.
+
+3. Memory is batch-aware. MemoryBank no longer holds a single persistent buffer;
+   memory tensors now have shape [B, num_items, layer_size] and every batch
+   element updates its own memory. Was: one shared buffer, updated only from
+   batch element [0].
+
+4. hidden_bias_init_value exposes the NumPy 0.5*ones hidden bias as an explicit
+   option (default: 0.5, matching NumPy). Set to None for small uniform init.
+
+5. init_memory_mode controls initial memory values. "random" matches the thesis
+   text ("memory randomly initialised"). "constant" matches the NumPy code
+   (0.5*ones). Default: "random".
+
+BROADCAST DESIGN: All memory banks project to ALL hidden layers. For 3-layer
+networks this reduces to the single hidden layer, matching NumPy exactly.
 """
 
 from typing import Dict, List, Optional, Tuple, NamedTuple
@@ -10,7 +35,13 @@ import torch.nn as nn
 
 
 class MRNState(NamedTuple):
-    """Container for MRN memory state."""
+    """
+    Container for MRN memory state.
+
+    memory_banks[layer_idx] has shape [B, num_items, layer_size] where B is
+    the batch size, num_items is the number of memory banks at that layer,
+    and layer_size is the width of the layer whose activations are stored.
+    """
 
     memory_banks: Dict[int, torch.Tensor]
 
@@ -19,111 +50,169 @@ class MRNState(NamedTuple):
             memory_banks={k: v.clone() for k, v in self.memory_banks.items()}
         )
 
+    def detach(self) -> "MRNState":
+        """Explicitly detach all tensors (breaks BPTT; use before a new window)."""
+        return MRNState(
+            memory_banks={k: v.detach() for k, v in self.memory_banks.items()}
+        )
+
+
+def _small_uniform(shape, scale: float, device: torch.device) -> torch.Tensor:
+    """Uniform(-scale, scale) on the given shape."""
+    return (torch.rand(*shape, device=device) * 2.0 - 1.0) * scale
+
 
 class MemoryBank(nn.Module):
     """
-    Memory bank that broadcasts to multiple target layers.
+    Memory bank with learned projections into one or more target hidden layers.
 
-    Each memory bank has separate weight matrices for each hidden layer it feeds.
+    No memory tensor is stored inside the module. Memory lives in MRNState so
+    it is batch-aware and so autograd can thread gradients through it.
     """
 
     def __init__(
         self,
         num_items: int,
         layer_size: int,
-        target_layer_sizes: Dict[int, int],  # {layer_idx: layer_size}
+        target_layer_sizes: Dict[int, int],
+        weight_init_range: float = 0.01,
+        init_memory_mode: str = "random",
+        init_memory_value: float = 0.5,
         device: Optional[torch.device] = None,
     ):
         super().__init__()
         self.num_items = num_items
         self.layer_size = layer_size
-        self.target_layer_sizes = target_layer_sizes
+        self.target_layer_sizes = dict(target_layer_sizes)
+        self.init_memory_mode = init_memory_mode
+        self.init_memory_value = init_memory_value
         self.device = device or torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
         )
 
-        # Memory buffer
-        self.register_buffer(
-            "memory", torch.rand(num_items, layer_size, device=self.device)
-        )
+        if init_memory_mode not in ("random", "constant"):
+            raise ValueError(
+                f"init_memory_mode must be 'random' or 'constant', "
+                f"got {init_memory_mode!r}"
+            )
 
-        # Separate weights for each target layer
+        # Learned projection weights: one (target_size, layer_size) matrix per
+        # (target layer, item) pair, initialized to small symmetric uniform.
         self.memory_weights = nn.ModuleDict()
-
         for target_layer_idx, target_size in target_layer_sizes.items():
             weights_for_layer = nn.ParameterList(
                 [
                     nn.Parameter(
-                        torch.rand(target_size, layer_size, device=self.device)
+                        _small_uniform(
+                            (target_size, layer_size), weight_init_range, self.device
+                        )
                     )
                     for _ in range(num_items)
                 ]
             )
             self.memory_weights[str(target_layer_idx)] = weights_for_layer
 
+    def init_memory(self, batch_size: int) -> torch.Tensor:
+        """
+        Create an initial memory tensor of shape [B, num_items, layer_size].
+
+        Per self.init_memory_mode: "random" (uniform [0, 1), matches the thesis
+        text) or "constant" (filled with init_memory_value, matches NumPy).
+        """
+        shape = (batch_size, self.num_items, self.layer_size)
+        if self.init_memory_mode == "random":
+            return torch.rand(*shape, device=self.device)
+        return torch.full(shape, self.init_memory_value, device=self.device)
+
     def compute_context(
-        self, memory_snapshot: torch.Tensor, target_layer: int
+        self, memory: torch.Tensor, target_layer: int
     ) -> torch.Tensor:
         """
-        Compute context for a specific target layer.
+        Compute the memory context for a specific target hidden layer.
 
         Args:
-            memory_snapshot: Current memory [num_items, layer_size]
-            target_layer: Which layer to compute context for
+            memory: [B, num_items, layer_size]
+            target_layer: which hidden layer is consuming this context
 
         Returns:
-            Context vector [target_layer_size]
+            context: [B, target_size]
         """
         target_layer_str = str(target_layer)
-
         if target_layer_str not in self.memory_weights:
             raise ValueError(f"No weights for target layer {target_layer}")
 
         weights = self.memory_weights[target_layer_str]
+        target_size = self.target_layer_sizes[target_layer]
+        batch_size = memory.shape[0]
+
+        if self.num_items == 0:
+            return torch.zeros(batch_size, target_size, device=memory.device)
+
         context_parts = []
-
         for i in range(self.num_items):
-            weight = weights[i]
-            context_parts.append(torch.matmul(weight, memory_snapshot[i]))
+            # memory[:, i, :]: [B, layer_size]
+            # weights[i]:      [target_size, layer_size]
+            # result:          [B, target_size]
+            context_i = torch.matmul(memory[:, i, :], weights[i].t())
+            context_parts.append(context_i)
 
-        if context_parts:
-            return torch.stack(context_parts).sum(dim=0)
-        else:
-            target_size = self.target_layer_sizes[target_layer]
-            return torch.zeros(target_size, device=self.device)
+        return torch.stack(context_parts, dim=0).sum(dim=0)
 
     def update_memory(
-        self, new_activation: torch.Tensor, memory_snapshot: torch.Tensor
+        self, new_activation: torch.Tensor, memory: torch.Tensor
     ) -> torch.Tensor:
-        """Sluggish state space update."""
-        new_memory = torch.zeros_like(memory_snapshot)
+        """
+        Sluggish state-space update. For item i with ratio r_i = (i+1)/K:
+
+            new_memory[:, i, :] = r_i * new_activation + (1 - r_i) * memory[:, i, :]
+
+        Args:
+            new_activation: [B, layer_size]
+            memory:         [B, num_items, layer_size]
+
+        Returns:
+            new_memory:     [B, num_items, layer_size]
+        """
+        parts = []
         for i in range(self.num_items):
             factor = (i + 1) / self.num_items
-            new_memory[i] = factor * new_activation + (1 - factor) * memory_snapshot[i]
-        return new_memory
-
-    def get_memory_state(self) -> torch.Tensor:
-        return self.memory.clone()
-
-    def set_memory_state(self, memory: torch.Tensor) -> None:
-        with torch.no_grad():
-            self.memory.copy_(memory)
+            parts.append(factor * new_activation + (1.0 - factor) * memory[:, i, :])
+        return torch.stack(parts, dim=1)
 
 
 class MRNCell(nn.Module):
     """
     MRN Cell with BROADCAST memory design.
 
-    All memory banks feed ALL hidden layers.
-    The output layer remains memory-free.
+    All memory banks feed ALL hidden layers. The output layer is memory-free.
+    Memory is carried in MRNState; this module holds only parameters.
     """
 
     def __init__(
         self,
         nn_structure: List[int],
         memory_structure: List[int],
+        weight_init_range: float = 0.01,
+        hidden_bias_init_value: Optional[float] = 0.5,
+        init_memory_mode: str = "random",
+        init_memory_value: float = 0.5,
         device: Optional[torch.device] = None,
     ):
+        """
+        Args:
+            nn_structure: layer sizes, e.g. [input, hidden, output]. Minimum 3.
+            memory_structure: memories per layer. Auto-padded with zeros to
+                match nn_structure length.
+            weight_init_range: all feedforward and memory-projection weights
+                are initialized to uniform(-weight_init_range, weight_init_range).
+                Thesis uses a small range; NumPy uses 0.01.
+            hidden_bias_init_value: if set, bias of the first hidden layer is
+                initialized to a constant of this value (NumPy does 0.5).
+                If None, first-hidden bias also uses small uniform.
+            init_memory_mode: "random" (thesis text) or "constant" (NumPy).
+            init_memory_value: value used when init_memory_mode == "constant".
+            device: target device.
+        """
         super().__init__()
 
         if len(nn_structure) < 3:
@@ -131,8 +220,12 @@ class MRNCell(nn.Module):
                 f"nn_structure must have at least 3 layers, got {len(nn_structure)}"
             )
 
-        self.nn_structure = nn_structure
+        self.nn_structure = list(nn_structure)
         self.num_layers = len(nn_structure)
+        self.weight_init_range = weight_init_range
+        self.hidden_bias_init_value = hidden_bias_init_value
+        self.init_memory_mode = init_memory_mode
+        self.init_memory_value = init_memory_value
         self.device = device or torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
         )
@@ -146,42 +239,98 @@ class MRNCell(nn.Module):
         self.weights = nn.ParameterDict()
         self.biases = nn.ParameterDict()
 
-        # Create network weights
+        vl = weight_init_range
+
+        # Feedforward weights and biases
         for layer_idx in range(1, self.num_layers):
             prev_size = nn_structure[layer_idx - 1]
             curr_size = nn_structure[layer_idx]
 
             self.weights[str(layer_idx)] = nn.Parameter(
-                torch.rand(curr_size, prev_size, device=self.device)
-            )
-            self.biases[str(layer_idx)] = nn.Parameter(
-                torch.rand(curr_size, device=self.device)
+                _small_uniform((curr_size, prev_size), vl, self.device)
             )
 
-        # Create memory banks - ALL project to ALL hidden layers
+            if layer_idx == 1 and hidden_bias_init_value is not None:
+                bias_tensor = torch.full(
+                    (curr_size,), hidden_bias_init_value, device=self.device
+                )
+            else:
+                bias_tensor = _small_uniform((curr_size,), vl, self.device)
+            self.biases[str(layer_idx)] = nn.Parameter(bias_tensor)
+
+        # Memory banks: chain topology (Option C.1). Each bank projects to
+        # exactly one hidden layer per the rule below. For 3-layer networks
+        # all banks target layer 1 (the single hidden), recovering the
+        # canonical MRN. See _chain_target for the rule.
         self.memory_banks = nn.ModuleDict()
-
-        # Build dict of hidden layer sizes (exclude input layer 0 and output layer)
-        hidden_layer_sizes = {i: nn_structure[i] for i in range(1, self.num_layers - 1)}
 
         for layer_idx in range(self.num_layers):
             num_memories = self.memory_structure[layer_idx]
-
             if num_memories > 0:
-                layer_size = nn_structure[layer_idx]
-
+                target = self._chain_target(layer_idx)
+                target_layer_sizes = {target: nn_structure[target]}
                 self.memory_banks[str(layer_idx)] = MemoryBank(
                     num_items=num_memories,
-                    layer_size=layer_size,
-                    target_layer_sizes=hidden_layer_sizes,
+                    layer_size=nn_structure[layer_idx],
+                    target_layer_sizes=target_layer_sizes,
+                    weight_init_range=vl,
+                    init_memory_mode=init_memory_mode,
+                    init_memory_value=init_memory_value,
                     device=self.device,
                 )
+
+    def _chain_target(self, source_layer: int) -> int:
+        """
+        Chain topology rule: which hidden layer does memory at source_layer feed?
+
+        - Input memory (layer 0) feeds the first hidden layer (1).
+        - Hidden memory at layer L for 1 <= L <= num_layers-3 feeds layer L+1
+          (the next hidden layer in the forward chain).
+        - Last hidden's memory (layer num_layers-2) self-loops, since the next
+          forward layer would be the output and the canonical MRN keeps the
+          output memory-free.
+        - Output memory (layer num_layers-1) feeds the first hidden layer (1),
+          preserving the long-range feedback semantics of the canonical MRN
+          where output memory feeds the input-side of the network.
+
+        For 3-layer networks (num_layers=3) all of the above resolve to layer 1,
+        so this rule reduces to the canonical "all memory feeds the hidden
+        layer" topology and the implementation matches Ulbricht/Orojo exactly.
+        """
+        if source_layer == 0:
+            return 1
+        if source_layer == self.num_layers - 1:
+            return 1
+        if source_layer == self.num_layers - 2:
+            return source_layer  # self-loop
+        return source_layer + 1
+
+    def init_state(self, batch_size: int = 1) -> MRNState:
+        """Create a fresh initial MRNState for the given batch size."""
+        return MRNState(
+            memory_banks={
+                int(layer_idx): bank.init_memory(batch_size)
+                for layer_idx, bank in self.memory_banks.items()
+            }
+        )
 
     def forward(
         self, inputs: torch.Tensor, state: Optional[MRNState] = None
     ) -> Tuple[torch.Tensor, Dict[int, torch.Tensor], MRNState]:
-        """Process one timestep."""
-        # Handle batch dimension
+        """
+        Process one timestep.
+
+        Args:
+            inputs: [B, input_size] or [input_size]
+            state: MRNState to read memory from. If None, a fresh state is
+                created. Pass an existing state (from a previous forward) to
+                chain timesteps together; autograd will backprop across them.
+
+        Returns:
+            output: [B, output_size] (or [output_size] if input was unbatched)
+            activations: dict of per-layer activations at this timestep
+            new_state: updated MRNState
+        """
         if inputs.dim() == 1:
             inputs = inputs.unsqueeze(0)
             squeeze_output = True
@@ -190,78 +339,62 @@ class MRNCell(nn.Module):
 
         batch_size = inputs.shape[0]
 
-        # Snapshot memory state
-        memory_snapshots = {}
-        if state is not None:
-            memory_snapshots = {
-                int(k): v.detach() for k, v in state.memory_banks.items()
-            }
-        else:
-            for layer_idx, bank in self.memory_banks.items():
-                memory_snapshots[int(layer_idx)] = bank.memory.detach().clone()
+        if state is None:
+            state = self.init_state(batch_size)
 
-        # Store activations
+        # Read memory from state WITHOUT detaching so BPTT works.
+        memory = {int(k): v for k, v in state.memory_banks.items()}
+
         activations = {0: inputs}
 
         # Forward pass through all layers
         for layer_idx in range(1, self.num_layers):
             prev_activation = activations[layer_idx - 1]
-
-            # Base computation: W @ prev + b
             activation_pre = (
                 torch.matmul(prev_activation, self.weights[str(layer_idx)].t())
                 + self.biases[str(layer_idx)]
             )
 
-            # BROADCAST: Add memory context to ALL HIDDEN LAYERS
-            if layer_idx < self.num_layers - 1:  # All hidden layers
+            # Add memory context to every hidden layer (output is memory-free).
+            # In chain topology, each bank projects to exactly one hidden layer,
+            # so we skip banks that don't have weights for this target.
+            if layer_idx < self.num_layers - 1:
                 context_parts = []
-
                 for mem_layer_idx_str, bank in self.memory_banks.items():
                     mem_layer_idx = int(mem_layer_idx_str)
-                    if mem_layer_idx in memory_snapshots:
-                        # Get context FOR THIS specific target layer
+                    if mem_layer_idx in memory and str(layer_idx) in bank.memory_weights:
                         bank_context = bank.compute_context(
-                            memory_snapshots[mem_layer_idx], target_layer=layer_idx
+                            memory[mem_layer_idx], target_layer=layer_idx
                         )
-                        context_parts.append(
-                            bank_context.unsqueeze(0).expand(batch_size, -1)
-                        )
+                        context_parts.append(bank_context)
 
                 if context_parts:
-                    context = torch.stack(context_parts).sum(dim=0)
+                    context = torch.stack(context_parts, dim=0).sum(dim=0)
                     activation_pre = activation_pre + context
 
-            # Apply activation function
             if layer_idx == self.num_layers - 1:
-                activation = activation_pre  # Output: linear
+                activation = activation_pre  # linear output
             else:
-                activation = torch.sigmoid(activation_pre)  # Hidden: sigmoid
+                activation = torch.sigmoid(activation_pre)
 
             activations[layer_idx] = activation
 
-        # Update memory banks
-        new_memory_snapshots = {}
+        # Update memory banks (no detach; gradients flow into next timestep)
         if self._update_memory_flag:
+            new_memory = {}
             for layer_idx in range(self.num_layers):
                 layer_idx_str = str(layer_idx)
                 if layer_idx_str in self.memory_banks:
-                    update_activation = activations[layer_idx][0].detach()
                     bank = self.memory_banks[layer_idx_str]
-
-                    old_memory = memory_snapshots[layer_idx]
-                    new_memory = bank.update_memory(update_activation, old_memory)
-                    new_memory_snapshots[layer_idx] = new_memory
-
-                    with torch.no_grad():
-                        bank.memory.copy_(new_memory)
-                else:
-                    if layer_idx in memory_snapshots:
-                        new_memory_snapshots[layer_idx] = memory_snapshots[layer_idx]
+                    new_memory[layer_idx] = bank.update_memory(
+                        activations[layer_idx], memory[layer_idx]
+                    )
+                elif layer_idx in memory:
+                    new_memory[layer_idx] = memory[layer_idx]
         else:
-            new_memory_snapshots = memory_snapshots
+            new_memory = memory
 
-        new_state = MRNState(memory_banks=new_memory_snapshots)
+        new_state = MRNState(memory_banks=new_memory)
         output = activations[self.num_layers - 1]
 
         if squeeze_output:
@@ -269,12 +402,3 @@ class MRNCell(nn.Module):
             activations = {k: v.squeeze(0) for k, v in activations.items()}
 
         return output, activations, new_state
-
-    def init_state(self) -> MRNState:
-        """Initialize a fresh state."""
-        return MRNState(
-            memory_banks={
-                int(layer_idx): bank.get_memory_state()
-                for layer_idx, bank in self.memory_banks.items()
-            }
-        )

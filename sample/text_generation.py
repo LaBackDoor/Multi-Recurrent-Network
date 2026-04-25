@@ -174,9 +174,6 @@ def generate_text(
     current_seq = [char_to_idx.get(c, 0) for c in seed_text]
     generated = seed_text
 
-    # Reset model memory
-    model.reset_memory()
-
     with torch.no_grad():
         for _ in range(length):
             # Prepare input (use last seq_length characters)
@@ -235,9 +232,6 @@ def train_epoch(
 
         optimizer.zero_grad()
 
-        # Reset memory for each sequence
-        model.reset_memory()
-
         # Get predictions for all timesteps
         outputs = model(
             input_one_hot, return_sequences=True
@@ -281,9 +275,6 @@ def evaluate(
             # One-hot encoding
             input_one_hot = torch.zeros(batch_size, seq_len, vocab_size, device=device)
             input_one_hot.scatter_(2, batch_input.unsqueeze(-1), 1.0)
-
-            # Reset memory
-            model.reset_memory()
 
             # Get predictions
             outputs = model(input_one_hot, return_sequences=True)
@@ -537,7 +528,6 @@ def main():
             if idx < vocab_size:
                 input_tensor[0, i, idx] = 1.0
 
-        model.reset_memory()
         logits = model(input_tensor, return_sequences=False)[0]  # [vocab_size]
 
         # Show the top 5 logits vs. probabilities

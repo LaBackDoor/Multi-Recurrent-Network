@@ -3,14 +3,12 @@ from typing import List, Optional, TYPE_CHECKING
 import torch
 import subprocess
 
-# FIX 1: We use TYPE_CHECKING to allow type hinting without causing a runtime circular import
 if TYPE_CHECKING:
     from src.model.mrn import MRN
 
 
 def print_gpu_memory():
     if torch.cuda.is_available():
-        # NVIDIA GPU (CUDA)
         for i in range(torch.cuda.device_count()):
             total_memory = torch.cuda.get_device_properties(i).total_memory / 1e9
             memory_used = torch.cuda.memory_allocated(i) / 1e9
@@ -20,7 +18,6 @@ def print_gpu_memory():
             )
 
     elif torch.backends.mps.is_available():
-        # Apple Silicon GPU (MPS)
         result = subprocess.run(
             ["sysctl", "hw.memsize"], capture_output=True, text=True
         )
@@ -35,11 +32,8 @@ def create_mrn_from_structure(
     nn_structure: List[int],
     mm_structure: List[int],
     device: Optional[torch.device] = None,
-) -> "MRN":  # FIX 2: Use a string forward reference for the return type
-    """
-    Create an MRN using the structure notation.
-    """
-    # FIX 3: Import MRN here, inside the function execution
+) -> "MRN":
+    """Create an MRN using the structure notation."""
     from src.model.mrn import MRN
 
     if len(nn_structure) < 3:
@@ -50,12 +44,10 @@ def create_mrn_from_structure(
     return MRN(nn_structure=nn_structure, memory_structure=mm_structure, device=device)
 
 
-def print_mrn_info(model: "MRN"):  # FIX 4: Use string "MRN" for type hint
+def print_mrn_info(model: "MRN"):
     """Print information about an MRN model."""
     print(f"MRN Model Information:")
     print(f"  Network structure: {model.nn_structure}")
-    # Note: Accessing model.cell might still be risky if MRN isn't fully initialized,
-    # but since this function is usually called AFTER creation, it is safe.
     print(f"  Memory structure: {model.cell.memory_structure}")
     print(f"  Number of layers: {model.num_layers}")
     print(f"  Input size: {model.input_size}")
@@ -93,8 +85,9 @@ def print_mrn_info(model: "MRN"):  # FIX 4: Use string "MRN" for type hint
                     else f"Hidden {layer_num}"
                 )
             )
+            targets = dict(bank.target_layer_sizes)
             print(
-                f"  Layer {layer_idx} ({layer_type}): {bank.num_items} items × {bank.layer_size} dims → {bank.output_size} output"
+                f"  Layer {layer_idx} ({layer_type}): {bank.num_items} items × {bank.layer_size} dims → hidden layers {targets}"
             )
 
     total_params = sum(p.numel() for p in model.parameters())

@@ -118,7 +118,6 @@ class MRNEnsemble:
         for model in self.models:
             model.eval()
             with torch.no_grad():
-                model.reset_memory()
                 pred = model(inputs, return_sequences=True)
                 all_predictions.append(pred)
 
@@ -161,7 +160,6 @@ class MRNEnsemble:
         for model in self.models:
             model.eval()
             with torch.no_grad():
-                model.reset_memory()
                 pred = model(inputs, return_sequences=True)
                 all_predictions.append(pred.cpu().numpy())
 
@@ -262,7 +260,6 @@ def train_single_model(
             batch_y = batch_y.to(device)
 
             optimizer.zero_grad()
-            model.reset_memory()
 
             outputs = model(batch_x, return_sequences=True)
             outputs = outputs.squeeze(-1)
@@ -286,7 +283,6 @@ def train_single_model(
                 batch_x = batch_x.to(device)
                 batch_y = batch_y.to(device)
 
-                model.reset_memory()
                 outputs = model(batch_x, return_sequences=True)
                 outputs = outputs.squeeze(-1)
 
@@ -598,7 +594,6 @@ def main():
                 batch_x = batch_x.to(device)
                 batch_y = batch_y.to(device)
 
-                model.reset_memory()
                 outputs = model(batch_x, return_sequences=True)
 
                 pred = outputs[:, -1, 0].cpu().numpy()

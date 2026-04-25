@@ -1,3 +1,5 @@
+"""Multi-Recurrent Neural Network (MRN) - sequence wrapper around MRNCell."""
+
 from typing import List, Optional, Tuple
 
 import torch
@@ -8,22 +10,31 @@ from src.model.cell import MRNCell, MRNState
 
 class MRN(nn.Module):
     """
-    Multi-Recurrent Neural Network - processes sequences.
+    Multi-Recurrent Neural Network.
 
-    This wraps MRNCell to process entire sequences
+    Wraps MRNCell to process whole sequences with BPTT.
 
     Args:
-        nn_structure: List of layer sizes [input_size, hidden1, ..., output_size]
-                     Minimum length is 3
-        memory_structure: List of memory bank sizes for each layer
-                         Auto-padded with zeros if shorter than nn_structure
-        device: Device to create tensors on
+        nn_structure: layer sizes [input, hidden..., output]. Minimum 3.
+        memory_structure: memories per layer (auto-padded with zeros).
+        weight_init_range: half-width of the symmetric uniform init range
+            for all feedforward and memory-projection weights. Default 0.01,
+            matching the NumPy reference and the thesis ("very small").
+        hidden_bias_init_value: constant value for the first hidden layer's
+            bias. Default 0.5, matching NumPy. Pass None for small uniform.
+        init_memory_mode: "random" (thesis text) or "constant" (NumPy).
+        init_memory_value: value used when init_memory_mode == "constant".
+        device: target device.
     """
 
     def __init__(
         self,
         nn_structure: List[int],
         memory_structure: List[int],
+        weight_init_range: float = 0.01,
+        hidden_bias_init_value: Optional[float] = 0.5,
+        init_memory_mode: str = "random",
+        init_memory_value: float = 0.5,
         device: Optional[torch.device] = None,
     ):
         super().__init__()
@@ -34,17 +45,23 @@ class MRN(nn.Module):
             "cuda" if torch.cuda.is_available() else "cpu"
         )
 
-        # Convenience properties
         self.input_size = nn_structure[0]
         self.output_size = nn_structure[-1]
         self.num_layers = len(nn_structure)
 
-        # Create the cell
         self.cell = MRNCell(
             nn_structure=nn_structure,
             memory_structure=memory_structure,
+            weight_init_range=weight_init_range,
+            hidden_bias_init_value=hidden_bias_init_value,
+            init_memory_mode=init_memory_mode,
+            init_memory_value=init_memory_value,
             device=self.device,
         )
+
+    def init_state(self, batch_size: int = 1) -> MRNState:
+        """Create a fresh initial state for a batch."""
+        return self.cell.init_state(batch_size)
 
     def forward(
         self,
@@ -58,49 +75,39 @@ class MRN(nn.Module):
         Process a sequence.
 
         Args:
-            inputs: Input sequence [batch_size, seq_len, input_size] or [seq_len, input_size]
-            states: Initial state (if None, uses current memory state)
-            return_sequences: If True, return all outputs; if False, return only last
-            return_state: If True, also return final state
-            return_activations: If True, also return all layer activations
+            inputs: [B, T, input_size] or [T, input_size]
+            states: initial MRNState. If None, a fresh state is created with
+                the right batch size. Pass an existing state to continue from
+                a previous segment (BPTT will run through the full chain).
+            return_sequences: if True, return outputs at every timestep,
+                otherwise only the final output.
+            return_state: also return the final state.
+            return_activations: also return all per-layer activations.
 
         Returns:
-            output: Output sequence or final output
-            activations: (optional) Dictionary of layer activations if return_activations=True
-            state: (optional) Final state if return_state=True
+            output (and optionally activations and final_state).
         """
-        # Handle input dimensions
         if inputs.dim() == 2:
-            # [seq_len, input_size] -> [1, seq_len, input_size]
             inputs = inputs.unsqueeze(0)
             squeeze_batch = True
         else:
             squeeze_batch = False
 
-        _, sequence_length, _ = inputs.shape
+        batch_size, sequence_length, _ = inputs.shape
 
-        # Initialize state if not provided
         if states is None:
-            states = self.cell.init_state()
+            states = self.cell.init_state(batch_size=batch_size)
 
-        # Process sequence
         outputs_values = []
         layer_activations_list = {i: [] for i in range(self.num_layers)}
 
         for t in range(sequence_length):
             cell_output, cell_activations, states = self.cell(inputs[:, t], states)
             outputs_values.append(cell_output)
-
-            # Store activations for each layer
             for layer_index, activation in cell_activations.items():
                 layer_activations_list[layer_index].append(activation)
 
-        # Stack outputs
-        outputs_values = torch.stack(
-            outputs_values, dim=1
-        )  # [batch_size, seq_len, output_size]
-
-        # Stack all activations into a new dict
+        outputs_values = torch.stack(outputs_values, dim=1)
         all_layer_activations = {
             layer_index: torch.stack(activations, dim=1)
             for layer_index, activations in layer_activations_list.items()
@@ -112,7 +119,6 @@ class MRN(nn.Module):
                 k: v.squeeze(0) for k, v in all_layer_activations.items()
             }
 
-        # Prepare return values
         if not return_sequences:
             outputs_values = (
                 outputs_values[:, -1] if not squeeze_batch else outputs_values[-1]
@@ -122,33 +128,13 @@ class MRN(nn.Module):
                 for k, v in all_layer_activations.items()
             }
 
-        # Build return tuple
         result = (outputs_values,)
-
         if return_activations:
             result = result + (all_layer_activations,)
-
         if return_state:
             result = result + (states,)
-
         return result if len(result) > 1 else result[0]
 
-    def reset_memory(self):
-        """Reset all memory banks to random values."""
-        with torch.no_grad():
-            for bank in self.cell.memory_banks.values():
-                # Create a new random tensor and copy to avoid in-place operation issues
-                new_memory = torch.rand_like(bank.memory)
-                bank.memory.copy_(new_memory)
-
     def set_update_memory(self, update: bool):
-        """
-        Enable or disable memory updates during forward passes.
-
-        This is useful during autoregressive generation where we want to
-        accumulate outputs without updating memory between steps.
-
-        Args:
-            update: If True, memory will be updated; if False, memory stays frozen
-        """
+        """Enable or disable memory updates during forward passes."""
         self.cell._update_memory_flag = update

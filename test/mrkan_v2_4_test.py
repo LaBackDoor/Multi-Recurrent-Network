@@ -52,6 +52,28 @@ def test_t1_custom_ratios_shape_validated():
     raise AssertionError("expected error for shape mismatch")
 
 
+def test_t1_custom_ratios_propagate_to_update_memory():
+    """Constructing a bank with non-default custom_ratios should change the
+    update_memory output by the corresponding factors. This is the invariant
+    Task 6's pruning surgery depends on."""
+    custom = torch.tensor([0.2, 0.8], dtype=torch.float32)
+    bank = KANMemoryBank(
+        num_items=2,
+        layer_size=4,
+        target_layer_sizes={1: 8},
+        custom_ratios=custom,
+        device=torch.device("cpu"),
+    )
+    memory = torch.zeros(1, 2, 4)
+    new_act = torch.ones(1, 4)
+    result = bank.update_memory(new_act, memory)
+    # Item 0: r=0.2 -> 0.2*1 + 0.8*0 = 0.2
+    # Item 1: r=0.8 -> 0.8*1 + 0.2*0 = 0.8
+    assert torch.allclose(result[0, 0, :], torch.full((4,), 0.2)), result[0, 0, :]
+    assert torch.allclose(result[0, 1, :], torch.full((4,), 0.8)), result[0, 1, :]
+    print("  [t1.4] custom_ratios propagate to update_memory: PASS")
+
+
 def main():
     print("=" * 70)
     print("MR-KAN v2.4 Task 1 tests")
@@ -60,6 +82,7 @@ def main():
         test_t1_layer_link_ratios_default_matches_v1_formula,
         test_t1_custom_ratios_respected,
         test_t1_custom_ratios_shape_validated,
+        test_t1_custom_ratios_propagate_to_update_memory,
     ]
     for t in tests:
         print()

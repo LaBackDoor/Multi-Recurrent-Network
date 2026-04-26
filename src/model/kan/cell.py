@@ -68,6 +68,13 @@ class KANMemoryBank(nn.Module):
     - learn_ratios=True (v2 SL-MR-KAN): an RCU computes r_i per timestep from
       (current_input, this bank's memory). See RatioControlUnit.
 
+    Args:
+        custom_ratios (optional): override the default (i+1)/K ratios. Used by
+            Task 6's shrink() to preserve original ratios for surviving items
+            after pruning.
+        layer_link_ratios (registered buffer): per-item layer-link factors used
+            in the non-RCU update path. Shape [num_items].
+
     Memory tensors live in MRKANState, not in this module, so memory is
     batch-aware and autograd can thread gradients through it.
     """
@@ -153,8 +160,8 @@ class KANMemoryBank(nn.Module):
         else:
             self.rcu = None
 
-        # ---- inserted section: persist KAN config + register layer_link_ratios buffer ----
-        # Persist KAN config so shrink() can rebuild a new bank with matching params.
+        # Persist KAN config for shrink() surgery in Task 6 (used to construct
+        # a new bank with matching configuration when pruning items).
         self._kan_grid_size = kan_grid_size
         self._kan_spline_order = kan_spline_order
         self._kan_enable_standalone_scale_spline = kan_enable_standalone_scale_spline
@@ -163,7 +170,10 @@ class KANMemoryBank(nn.Module):
         self._kan_grid_range = kan_grid_range
         self._ratio_control_use_kan = ratio_control_use_kan
 
-        # Register layer_link_ratios buffer. Default: (i+1)/K, matching v1.
+        # layer_link_ratios buffer: per-item layer-link factors for the
+        # sluggish update. Default (i+1)/K (v1 formula); shrink() slices
+        # this buffer when dropping items so survivors keep their original
+        # ratios.
         if custom_ratios is None:
             ratios = torch.tensor(
                 [(i + 1) / num_items for i in range(num_items)], dtype=torch.float32
@@ -175,7 +185,6 @@ class KANMemoryBank(nn.Module):
                 )
             ratios = custom_ratios.detach().to(torch.float32).clone()
         self.register_buffer("layer_link_ratios", ratios)
-        # ---- end inserted section ----
 
         self.to(self.device)
 
@@ -224,7 +233,9 @@ class KANMemoryBank(nn.Module):
 
         Two paths, controlled at construction time by ``learn_ratios``:
 
-        - RCU is None (v1): fixed per-item ratio r_i = (i + 1) / K.
+        - RCU is None (v1): per-item ratio r_i comes from the layer_link_ratios
+          buffer (default: (i + 1) / K, but may be overridden via custom_ratios
+          in __init__).
         - RCU is present (v2): r_i computed from (current_input, memory).
 
         Args:
@@ -370,6 +381,8 @@ class MRKANCell(nn.Module):
                 self.biases[str(layer_idx)] = nn.Parameter(bias_tensor)
 
         # Memory banks (chain topology, optional RCU).
+        # Note: custom_ratios is not exposed here; Task 6's shrink() passes it
+        # directly when rebuilding a pruned bank.
         self.memory_banks = nn.ModuleDict()
         for layer_idx in range(self.num_layers):
             num_memories = self.memory_structure[layer_idx]

@@ -4,6 +4,8 @@ import torch
 import torch.nn as nn
 
 from src.model.kan import MRKAN, KANMemoryBank
+from src.model.kan.pruning import cosine_similarity_fn
+from src.model.kan.kan_linear import KANLinear
 
 
 def test_t1_layer_link_ratios_default_matches_v1_formula():
@@ -74,21 +76,62 @@ def test_t1_custom_ratios_propagate_to_update_memory():
     print("  [t1.4] custom_ratios propagate to update_memory: PASS")
 
 
+def test_t2_identical_kans_have_similarity_one():
+    """Two KANLinears with cloned weights should produce sim ~ 1.0."""
+    torch.manual_seed(0)
+    kan_a = KANLinear(8, 4)
+    kan_b = KANLinear(8, 4)
+    # Clone weights from a to b
+    kan_b.load_state_dict(kan_a.state_dict())
+
+    refs = torch.randn(64, 8)
+    sim = cosine_similarity_fn(kan_a, kan_b, refs)
+    assert sim > 0.999, f"identical kans should have sim ~ 1.0, got {sim}"
+    print(f"  [t2.1] identical KANs sim={sim:.6f}: PASS")
+
+
+def test_t2_random_kans_have_lower_similarity():
+    """Two independently random-init KANLinears should produce sim < 0.99."""
+    torch.manual_seed(0)
+    kan_a = KANLinear(8, 4)
+    torch.manual_seed(1)
+    kan_b = KANLinear(8, 4)
+    refs = torch.randn(64, 8)
+    sim = cosine_similarity_fn(kan_a, kan_b, refs)
+    assert sim < 0.99, f"random KANs should have sim < 0.99, got {sim}"
+    print(f"  [t2.2] random KANs sim={sim:.6f}: PASS")
+
+
+def test_t2_similarity_in_unit_interval():
+    """cosine_similarity_fn should always return a float in [0, 1]."""
+    torch.manual_seed(2)
+    for _ in range(5):
+        kan_a = KANLinear(6, 3)
+        kan_b = KANLinear(6, 3)
+        refs = torch.randn(32, 6)
+        sim = cosine_similarity_fn(kan_a, kan_b, refs)
+        assert 0.0 <= sim <= 1.0, f"sim out of [0,1]: {sim}"
+    print("  [t2.3] cosine_similarity_fn in [0, 1]: PASS")
+
+
 def main():
     print("=" * 70)
-    print("MR-KAN v2.4 Task 1 tests")
+    print("MR-KAN v2.4 Task 1 and 2 tests")
     print("=" * 70)
     tests = [
         test_t1_layer_link_ratios_default_matches_v1_formula,
         test_t1_custom_ratios_respected,
         test_t1_custom_ratios_shape_validated,
         test_t1_custom_ratios_propagate_to_update_memory,
+        test_t2_identical_kans_have_similarity_one,
+        test_t2_random_kans_have_lower_similarity,
+        test_t2_similarity_in_unit_interval,
     ]
     for t in tests:
         print()
         t()
     print("\n" + "=" * 70)
-    print("All MR-KAN v2.4 Task 1 tests passed.")
+    print("All MR-KAN v2.4 Task 1 and 2 tests passed.")
     print("=" * 70)
 
 

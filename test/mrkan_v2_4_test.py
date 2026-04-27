@@ -619,9 +619,52 @@ def test_t8_sl_mrkan_pruning_works():
     print("  [t8.3] SL-MR-KAN pruning: correct drops + forward pass: PASS")
 
 
+def test_t9_v1_default_pruned_at_one_is_unchanged():
+    """A v1-default model (no v2 toggles) pruned at threshold=1.0 has the
+    same param count and identical buffers as the original."""
+    torch.manual_seed(0)
+    model = MRKAN(
+        nn_structure=[8, 16, 1],
+        memory_structure=[3, 2, 3],
+        device=torch.device("cpu"),
+    )
+    pruned, stats = model.prune(threshold=1.0)
+
+    assert pruned.cell.memory_structure == model.cell.memory_structure
+    assert stats.items_dropped == 0
+
+    n_orig = sum(p.numel() for p in model.parameters())
+    n_pruned = sum(p.numel() for p in pruned.parameters())
+    assert n_orig == n_pruned, (n_orig, n_pruned)
+
+    for (kn, ko), (pn, po) in zip(
+        model.named_buffers(), pruned.named_buffers()
+    ):
+        assert kn == pn, f"buffer name mismatch {kn} vs {pn}"
+        assert torch.allclose(ko, po), f"buffer {kn} differs"
+    print("  [t9.1] v1 regression: threshold=1.0 preserves state: PASS")
+
+
+def test_t9_public_exports():
+    """v2.4 public symbols are reachable via the package root."""
+    from src.model.kan import (
+        MRKAN,
+        BankPruningStats,
+        PruningStats,
+        cosine_similarity_fn,
+        resolve_pruning,
+    )
+    assert MRKAN is not None
+    assert BankPruningStats is not None
+    assert PruningStats is not None
+    assert callable(cosine_similarity_fn)
+    assert callable(resolve_pruning)
+    print("  [t9.2] public exports reachable: PASS")
+
+
 def main():
     print("=" * 70)
-    print("MR-KAN v2.4 Tasks 1-8 tests")
+    print("MR-KAN v2.4 Tasks 1-9 tests")
     print("=" * 70)
     tests = [
         test_t1_layer_link_ratios_default_matches_v1_formula,
@@ -654,12 +697,14 @@ def main():
         test_t8_functional_equivalence_after_pruning,
         test_t8_bptt_through_pruned_model,
         test_t8_sl_mrkan_pruning_works,
+        test_t9_v1_default_pruned_at_one_is_unchanged,
+        test_t9_public_exports,
     ]
     for t in tests:
         print()
         t()
     print("\n" + "=" * 70)
-    print("All MR-KAN v2.4 Tasks 1-8 tests passed.")
+    print("All MR-KAN v2.4 Tasks 1-9 tests passed.")
     print("=" * 70)
 
 

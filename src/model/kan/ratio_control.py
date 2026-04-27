@@ -168,13 +168,10 @@ class RatioControlUnit(nn.Module):
                 new_rcu.unit.spline_scaler.data.copy_(
                     self.unit.spline_scaler.data[row_idx][:, col_mask]
                 )
-            if self.unit.layer_norm is not None and new_rcu.unit.layer_norm is not None:
-                new_rcu.unit.layer_norm.weight.data.copy_(
-                    self.unit.layer_norm.weight.data[col_mask]
-                )
-                new_rcu.unit.layer_norm.bias.data.copy_(
-                    self.unit.layer_norm.bias.data[col_mask]
-                )
+            # LayerNorm weights are intentionally not transplanted: the shrunk
+            # RCU is always created with kan_use_layernorm=False (see __init__
+            # comment above) because LN normalizes all input features jointly,
+            # so surgical weight slicing cannot preserve LN-normalized outputs.
             new_rcu.unit.grid.copy_(self.unit.grid[col_mask])
         else:
             new_rcu.unit.weight.data.copy_(

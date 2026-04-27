@@ -594,6 +594,7 @@ class MRKANCell(nn.Module):
                 for kan in per_item:
                     kan.update_grid(x)
 
+    @torch.no_grad()
     def compute_spline_similarities(
         self,
         reference_inputs: Optional[Dict[int, torch.Tensor]] = None,
@@ -604,6 +605,9 @@ class MRKANCell(nn.Module):
 
         See MRKAN.compute_spline_similarities for full contract.
         """
+        # Deferred import: pruning.py -> kan_linear.py, cell.py -> kan_linear.py
+        # both exist at the top level; importing pruning at module level would
+        # create a circular dependency (cell.py ← pruning.py ← cell.py).
         from src.model.kan.pruning import cosine_similarity_fn
 
         if similarity_fn is None:

@@ -17,7 +17,7 @@ cosine similarity on flattened ``(N, out_features)`` outputs, clamped into
 [0, 1] via ``max(0, sim)`` so the threshold semantic is monotonic.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable, Dict, List, Tuple
 
 import torch

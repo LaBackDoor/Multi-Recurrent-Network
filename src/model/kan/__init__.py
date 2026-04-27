@@ -6,6 +6,7 @@ from src.model.kan.mrkan import MRKAN
 from src.model.kan.pruning import (
     BankPruningStats,
     PruningStats,
+    SimilarityFn,
     cosine_similarity_fn,
     resolve_pruning,
 )
@@ -20,6 +21,7 @@ __all__ = [
     "MRKANState",
     "PruningStats",
     "RatioControlUnit",
+    "SimilarityFn",
     "cosine_similarity_fn",
     "resolve_pruning",
 ]

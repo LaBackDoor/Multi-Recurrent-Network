@@ -163,6 +163,7 @@ class MRKAN(nn.Module):
         """
         self.cell.update_grids(calibration_inputs)
 
+    @torch.no_grad()
     def compute_spline_similarities(
         self,
         reference_inputs=None,
@@ -259,6 +260,11 @@ class MRKAN(nn.Module):
         external_input_size = self.input_size
         for src_key, original_bank in self.cell.memory_banks.items():
             src = int(src_key)
+            # MRKANCell always constructs single-target banks (chain topology)
+            assert len(original_bank.memory_kans) == 1, (
+                f"expected single-target bank at src={src}, "
+                f"got {list(original_bank.memory_kans.keys())}"
+            )
             tgt_key = next(iter(original_bank.memory_kans.keys()))
             tgt = int(tgt_key)
             bank_stat = bank_decisions[(src, tgt)]

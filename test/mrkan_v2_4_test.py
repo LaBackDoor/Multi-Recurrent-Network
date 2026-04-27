@@ -91,15 +91,52 @@ def test_t2_identical_kans_have_similarity_one():
 
 
 def test_t2_random_kans_have_lower_similarity():
-    """Two independently random-init KANLinears should produce sim < 0.99."""
+    """Two independently random-init KANLinears should produce sim < 0.5."""
     torch.manual_seed(0)
     kan_a = KANLinear(8, 4)
     torch.manual_seed(1)
     kan_b = KANLinear(8, 4)
     refs = torch.randn(64, 8)
     sim = cosine_similarity_fn(kan_a, kan_b, refs)
-    assert sim < 0.99, f"random KANs should have sim < 0.99, got {sim}"
+    assert sim < 0.5, f"random KANs should have sim < 0.5, got {sim}"
     print(f"  [t2.2] random KANs sim={sim:.6f}: PASS")
+
+
+def test_t2_validation_errors():
+    """cosine_similarity_fn should raise ValueError for incompatible KANs or bad refs."""
+    kan_a = KANLinear(8, 4)
+    kan_b = KANLinear(8, 4)
+    refs = torch.randn(32, 8)
+
+    # in_features mismatch
+    try:
+        cosine_similarity_fn(KANLinear(6, 4), kan_b, torch.randn(32, 6))
+        raise AssertionError("expected ValueError for in_features mismatch")
+    except ValueError:
+        pass
+
+    # out_features mismatch
+    try:
+        cosine_similarity_fn(kan_a, KANLinear(8, 5), refs)
+        raise AssertionError("expected ValueError for out_features mismatch")
+    except ValueError:
+        pass
+
+    # reference_inputs wrong shape (1D)
+    try:
+        cosine_similarity_fn(kan_a, kan_b, torch.randn(8))
+        raise AssertionError("expected ValueError for 1D reference_inputs")
+    except ValueError:
+        pass
+
+    # reference_inputs wrong in_features
+    try:
+        cosine_similarity_fn(kan_a, kan_b, torch.randn(32, 6))
+        raise AssertionError("expected ValueError for wrong reference_inputs in_features")
+    except ValueError:
+        pass
+
+    print("  [t2.4] validation errors raised correctly: PASS")
 
 
 def test_t2_similarity_in_unit_interval():
@@ -116,7 +153,7 @@ def test_t2_similarity_in_unit_interval():
 
 def main():
     print("=" * 70)
-    print("MR-KAN v2.4 Task 1 and 2 tests")
+    print("MR-KAN v2.4 Tasks 1 and 2 tests")
     print("=" * 70)
     tests = [
         test_t1_layer_link_ratios_default_matches_v1_formula,
@@ -125,13 +162,14 @@ def main():
         test_t1_custom_ratios_propagate_to_update_memory,
         test_t2_identical_kans_have_similarity_one,
         test_t2_random_kans_have_lower_similarity,
+        test_t2_validation_errors,
         test_t2_similarity_in_unit_interval,
     ]
     for t in tests:
         print()
         t()
     print("\n" + "=" * 70)
-    print("All MR-KAN v2.4 Task 1 and 2 tests passed.")
+    print("All MR-KAN v2.4 Tasks 1 and 2 tests passed.")
     print("=" * 70)
 
 

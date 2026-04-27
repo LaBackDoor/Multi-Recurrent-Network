@@ -56,4 +56,6 @@ def cosine_similarity_fn(
     out_a = kan_a(reference_inputs).reshape(-1)
     out_b = kan_b(reference_inputs).reshape(-1)
     sim = torch.nn.functional.cosine_similarity(out_a, out_b, dim=0).item()
-    return max(0.0, min(1.0, sim))
+    # Cosine similarity is bounded in [-1, 1]; clamp negatives to 0 so the
+    # metric is monotonically "more similar" (0 = orthogonal, 1 = identical).
+    return max(0.0, sim)

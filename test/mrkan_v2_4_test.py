@@ -521,9 +521,107 @@ def test_t7_param_count_matches_new_structure():
     print(f"  [t7.5] param count matches structure: {pruned_count} == {fresh_count}: PASS")
 
 
+def test_t8_functional_equivalence_after_pruning():
+    """Pruned model output equals original with dropped item weights zeroed.
+
+    With dropped items' KAN weights set to zero, both models see the same
+    context at every step, producing identical outputs (within float precision).
+    """
+    torch.manual_seed(0)
+    model = MRKAN(
+        nn_structure=[8, 16, 1],
+        memory_structure=[0, 4, 0],
+        device=torch.device("cpu"),
+    )
+    bank = model.cell.memory_banks["1"]
+    per_item = bank.memory_kans["1"]
+    per_item[2].load_state_dict(per_item[0].state_dict())
+
+    refs = {1: torch.randn(128, 16)}
+    pruned, stats = model.prune(threshold=0.99, reference_inputs=refs)
+
+    torch.manual_seed(42)
+    seq = torch.randn(2, 5, 8)
+
+    orig_state = model.init_state(batch_size=2)
+    surviving = stats.banks[(1, 1)].surviving_indices
+    pruned_state_banks = dict(orig_state.memory_banks)
+    pruned_state_banks[1] = orig_state.memory_banks[1][:, surviving, :]
+    from src.model.kan import MRKANState
+    pruned_state = MRKANState(memory_banks=pruned_state_banks)
+
+    out_pruned = pruned(seq, states=pruned_state)
+
+    import copy as _c
+    orig_for_compare = _c.deepcopy(model)
+    dropped = stats.banks[(1, 1)].dropped_indices
+    for i in dropped:
+        kan_i = orig_for_compare.cell.memory_banks["1"].memory_kans["1"][i]
+        kan_i.base_weight.data.zero_()
+        kan_i.spline_weight.data.zero_()
+        if kan_i.enable_standalone_scale_spline:
+            kan_i.spline_scaler.data.zero_()
+    out_orig_zeroed = orig_for_compare(seq, states=orig_state)
+
+    diff = (out_pruned - out_orig_zeroed).abs().max().item()
+    assert diff < 1e-4, f"functional equivalence broken: {diff}"
+    print(f"  [t8.1] functional equivalence (max abs diff={diff:.2e}): PASS")
+
+
+def test_t8_bptt_through_pruned_model():
+    """loss.backward() on pruned model populates grads on every kept parameter."""
+    torch.manual_seed(0)
+    model = MRKAN(
+        nn_structure=[6, 12, 1],
+        memory_structure=[2, 2, 2],
+        device=torch.device("cpu"),
+    )
+    pruned, stats = model.prune(threshold=-1.0)
+
+    seq = torch.randn(2, 4, 6)
+    out = pruned(seq)
+    out.sum().backward()
+
+    for name, p in pruned.named_parameters():
+        assert p.grad is not None, f"no grad on {name}"
+        assert torch.isfinite(p.grad).all(), f"non-finite grad on {name}"
+    print("  [t8.2] BPTT through pruned model: PASS")
+
+
+def test_t8_sl_mrkan_pruning_works():
+    """learn_ratios=True model prunes correctly: right items dropped, pruned
+    model runs forward, RCU has correct shape."""
+    torch.manual_seed(0)
+    model = MRKAN(
+        nn_structure=[8, 16, 1],
+        memory_structure=[0, 4, 0],
+        learn_ratios=True,
+        device=torch.device("cpu"),
+    )
+    bank = model.cell.memory_banks["1"]
+    per_item = bank.memory_kans["1"]
+    per_item[2].load_state_dict(per_item[0].state_dict())
+
+    refs = {1: torch.randn(64, 16)}
+    pruned, stats = model.prune(threshold=0.99, reference_inputs=refs)
+
+    assert stats.banks[(1, 1)].dropped_indices == [2], stats.banks[(1, 1)].dropped_indices
+
+    pruned_rcu = pruned.cell.memory_banks["1"].rcu
+    assert pruned_rcu is not None
+    assert pruned_rcu.num_items == 3
+    assert pruned_rcu.memory_size == 3 * 16
+
+    seq = torch.randn(2, 4, 8)
+    out = pruned(seq)
+    assert out.shape == (2, 4, 1)
+
+    print("  [t8.3] SL-MR-KAN pruning: correct drops + forward pass: PASS")
+
+
 def main():
     print("=" * 70)
-    print("MR-KAN v2.4 Tasks 1-7 tests")
+    print("MR-KAN v2.4 Tasks 1-8 tests")
     print("=" * 70)
     tests = [
         test_t1_layer_link_ratios_default_matches_v1_formula,
@@ -553,12 +651,15 @@ def main():
         test_t7_aggressive_threshold_respects_guard,
         test_t7_cloned_twins_drop_higher_index,
         test_t7_param_count_matches_new_structure,
+        test_t8_functional_equivalence_after_pruning,
+        test_t8_bptt_through_pruned_model,
+        test_t8_sl_mrkan_pruning_works,
     ]
     for t in tests:
         print()
         t()
     print("\n" + "=" * 70)
-    print("All MR-KAN v2.4 Tasks 1-7 tests passed.")
+    print("All MR-KAN v2.4 Tasks 1-8 tests passed.")
     print("=" * 70)
 
 

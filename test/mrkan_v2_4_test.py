@@ -151,9 +151,70 @@ def test_t2_similarity_in_unit_interval():
     print("  [t2.3] cosine_similarity_fn in [0, 1]: PASS")
 
 
+def test_t3_compute_similarities_shape_and_diagonal():
+    """Returned matrices have shape (K, K) and diagonal == 1.0."""
+    model = MRKAN(
+        nn_structure=[10, 20, 1],
+        memory_structure=[4, 3, 4],
+        device=torch.device("cpu"),
+    )
+    sims = model.compute_spline_similarities(n_samples=32)
+
+    expected_keys = {(0, 1), (1, 1), (2, 1)}
+    assert set(sims.keys()) == expected_keys, sims.keys()
+    expected_K = {(0, 1): 4, (1, 1): 3, (2, 1): 4}
+    for key, mat in sims.items():
+        K = expected_K[key]
+        assert mat.shape == (K, K), f"{key}: got {mat.shape}, expected ({K},{K})"
+        assert torch.allclose(torch.diagonal(mat), torch.ones(K), atol=1e-5)
+    print("  [t3.1] shape + diagonal: PASS")
+
+
+def test_t3_cloned_items_detected_off_diagonal():
+    """If we clone item 0's weights into item 2 within a bank, sim[0, 2] ~ 1.0."""
+    torch.manual_seed(0)
+    model = MRKAN(
+        nn_structure=[8, 16, 1],
+        memory_structure=[0, 4, 0],
+        device=torch.device("cpu"),
+    )
+    bank = model.cell.memory_banks["1"]
+    per_item = bank.memory_kans["1"]
+    per_item[2].load_state_dict(per_item[0].state_dict())
+
+    refs = {1: torch.randn(64, 16)}
+    sims = model.compute_spline_similarities(reference_inputs=refs)
+
+    mat = sims[(1, 1)]
+    assert mat[0, 2] > 0.999, f"cloned items should have sim~1.0, got {mat[0, 2]}"
+    assert mat[0, 1] < 0.999, f"non-cloned items should have sim<0.999, got {mat[0, 1]}"
+    print(f"  [t3.2] cloned item detected: sim[0,2]={mat[0,2]:.6f}, sim[0,1]={mat[0,1]:.6f}: PASS")
+
+
+def test_t3_pluggable_similarity_fn():
+    """A custom similarity_fn is honored."""
+    model = MRKAN(
+        nn_structure=[6, 12, 1],
+        memory_structure=[0, 2, 0],
+        device=torch.device("cpu"),
+    )
+
+    def constant_sim(a, b, refs):
+        return 0.5
+
+    sims = model.compute_spline_similarities(
+        similarity_fn=constant_sim,
+        n_samples=8,
+    )
+    mat = sims[(1, 1)]
+    assert mat[0, 1] == 0.5 and mat[1, 0] == 0.5
+    assert mat[0, 0] == 1.0 and mat[1, 1] == 1.0
+    print("  [t3.3] pluggable similarity_fn honored: PASS")
+
+
 def main():
     print("=" * 70)
-    print("MR-KAN v2.4 Tasks 1 and 2 tests")
+    print("MR-KAN v2.4 Tasks 1-3 tests")
     print("=" * 70)
     tests = [
         test_t1_layer_link_ratios_default_matches_v1_formula,
@@ -164,12 +225,15 @@ def main():
         test_t2_random_kans_have_lower_similarity,
         test_t2_validation_errors,
         test_t2_similarity_in_unit_interval,
+        test_t3_compute_similarities_shape_and_diagonal,
+        test_t3_cloned_items_detected_off_diagonal,
+        test_t3_pluggable_similarity_fn,
     ]
     for t in tests:
         print()
         t()
     print("\n" + "=" * 70)
-    print("All MR-KAN v2.4 Tasks 1 and 2 tests passed.")
+    print("All MR-KAN v2.4 Tasks 1-3 tests passed.")
     print("=" * 70)
 
 

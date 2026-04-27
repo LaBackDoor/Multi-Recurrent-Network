@@ -163,6 +163,33 @@ class MRKAN(nn.Module):
         """
         self.cell.update_grids(calibration_inputs)
 
+    def compute_spline_similarities(
+        self,
+        reference_inputs=None,
+        similarity_fn=None,
+        n_samples: int = 128,
+    ):
+        """Per-bank KxK pairwise similarity matrices over memory items.
+
+        Args:
+            reference_inputs: optional dict mapping source-layer index to a
+                2D tensor [N, layer_size] of reference inputs to feed each
+                KANLinear in that bank. Layers absent from this dict get
+                fresh ``torch.randn(n_samples, layer_size)`` per call.
+            similarity_fn: callable matching the SimilarityFn contract from
+                ``src.model.kan.pruning``. Defaults to cosine similarity.
+            n_samples: N when reference_inputs is None for a source layer.
+
+        Returns:
+            dict {(source_layer, target_layer): tensor[K, K]}. Diagonal is
+            1.0 by construction (item identical to itself).
+        """
+        return self.cell.compute_spline_similarities(
+            reference_inputs=reference_inputs,
+            similarity_fn=similarity_fn,
+            n_samples=n_samples,
+        )
+
     @torch.no_grad()
     def calibrate_grids(
         self,

@@ -528,3 +528,39 @@ class MRKANCell(nn.Module):
             for per_item in bank.memory_kans.values():
                 for kan in per_item:
                     kan.update_grid(x)
+
+    def compute_spline_similarities(
+        self,
+        reference_inputs: Optional[Dict[int, torch.Tensor]] = None,
+        similarity_fn=None,
+        n_samples: int = 128,
+    ) -> Dict[Tuple[int, int], torch.Tensor]:
+        """Per-bank KxK similarity matrices over memory items.
+
+        See MRKAN.compute_spline_similarities for full contract.
+        """
+        from src.model.kan.pruning import cosine_similarity_fn
+
+        if similarity_fn is None:
+            similarity_fn = cosine_similarity_fn
+        if reference_inputs is None:
+            reference_inputs = {}
+
+        result: Dict[Tuple[int, int], torch.Tensor] = {}
+        for src_key, bank in self.memory_banks.items():
+            src = int(src_key)
+            refs = reference_inputs.get(
+                src, torch.randn(n_samples, bank.layer_size, device=self.device)
+            )
+
+            for tgt_key, per_item in bank.memory_kans.items():
+                tgt = int(tgt_key)
+                K = len(per_item)
+                mat = torch.eye(K, dtype=torch.float32)
+                for i in range(K):
+                    for j in range(i + 1, K):
+                        sim = similarity_fn(per_item[i], per_item[j], refs)
+                        mat[i, j] = sim
+                        mat[j, i] = sim
+                result[(src, tgt)] = mat
+        return result

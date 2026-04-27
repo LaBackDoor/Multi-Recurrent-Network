@@ -212,9 +212,93 @@ def test_t3_pluggable_similarity_fn():
     print("  [t3.3] pluggable similarity_fn honored: PASS")
 
 
+def test_t4_resolve_pruning_drops_higher_index():
+    """Pair (0, 2) above threshold: keep 0, drop 2."""
+    from src.model.kan.pruning import resolve_pruning
+    sim = torch.tensor(
+        [[1.0, 0.5, 0.99, 0.5],
+         [0.5, 1.0, 0.5, 0.5],
+         [0.99, 0.5, 1.0, 0.5],
+         [0.5, 0.5, 0.5, 1.0]]
+    )
+    dropped, surviving, triggering = resolve_pruning(sim, threshold=0.95)
+    assert dropped == [2], dropped
+    assert surviving == [0, 1, 3], surviving
+    assert len(triggering) == 1
+    assert triggering[0][0] == 0 and triggering[0][1] == 2
+    assert abs(triggering[0][2] - 0.99) < 1e-6
+    print("  [t4.1] resolve_pruning drops higher index of similar pair: PASS")
+
+
+def test_t4_resolve_pruning_iterative_not_transitive():
+    """sim(0,1)=0.96, sim(1,2)=0.96, sim(0,2)=0.5: drop 1 only."""
+    from src.model.kan.pruning import resolve_pruning
+    sim = torch.tensor(
+        [[1.0, 0.96, 0.5],
+         [0.96, 1.0, 0.96],
+         [0.5, 0.96, 1.0]]
+    )
+    dropped, surviving, triggering = resolve_pruning(sim, threshold=0.95)
+    assert dropped == [1], dropped
+    assert surviving == [0, 2], surviving
+    print("  [t4.2] iterative (not transitive) pruning: PASS")
+
+
+def test_t4_resolve_pruning_guard_keeps_at_least_one():
+    """Even with threshold=-1 (all pairs trigger), at least one item survives."""
+    from src.model.kan.pruning import resolve_pruning
+    sim = torch.full((4, 4), 0.99)
+    sim.fill_diagonal_(1.0)
+    dropped, surviving, triggering = resolve_pruning(sim, threshold=-1.0)
+    assert len(surviving) == 1, surviving
+    assert surviving == [0]
+    assert dropped == [1, 2, 3]
+    print("  [t4.3] >=1-per-bank guard respected: PASS")
+
+
+def test_t4_resolve_pruning_no_drops_under_threshold():
+    """Threshold > all pairs: nothing dropped."""
+    from src.model.kan.pruning import resolve_pruning
+    sim = torch.tensor([[1.0, 0.4, 0.3], [0.4, 1.0, 0.5], [0.3, 0.5, 1.0]])
+    dropped, surviving, triggering = resolve_pruning(sim, threshold=0.95)
+    assert dropped == []
+    assert surviving == [0, 1, 2]
+    assert triggering == []
+    print("  [t4.4] no drops below threshold: PASS")
+
+
+def test_t4_dataclasses_construct():
+    """BankPruningStats and PruningStats can be instantiated and field-accessed."""
+    from src.model.kan.pruning import BankPruningStats, PruningStats
+    bp = BankPruningStats(
+        source_layer=0,
+        target_layer=1,
+        original_K=4,
+        surviving_K=3,
+        dropped_indices=[2],
+        surviving_indices=[0, 1, 3],
+        similarity_matrix=torch.eye(4),
+        triggering_pairs=[(0, 2, 0.97)],
+    )
+    assert bp.original_K == 4 and bp.surviving_K == 3
+
+    ps = PruningStats(
+        threshold=0.95,
+        similarity_fn_name="cosine_similarity_fn",
+        banks={(0, 1): bp},
+        items_dropped=1,
+        items_kept=3,
+        params_before=1000,
+        params_after=850,
+    )
+    assert ps.threshold == 0.95
+    assert ps.banks[(0, 1)].dropped_indices == [2]
+    print("  [t4.5] PruningStats / BankPruningStats dataclasses: PASS")
+
+
 def main():
     print("=" * 70)
-    print("MR-KAN v2.4 Tasks 1-3 tests")
+    print("MR-KAN v2.4 Tasks 1-4 tests")
     print("=" * 70)
     tests = [
         test_t1_layer_link_ratios_default_matches_v1_formula,
@@ -228,12 +312,17 @@ def main():
         test_t3_compute_similarities_shape_and_diagonal,
         test_t3_cloned_items_detected_off_diagonal,
         test_t3_pluggable_similarity_fn,
+        test_t4_resolve_pruning_drops_higher_index,
+        test_t4_resolve_pruning_iterative_not_transitive,
+        test_t4_resolve_pruning_guard_keeps_at_least_one,
+        test_t4_resolve_pruning_no_drops_under_threshold,
+        test_t4_dataclasses_construct,
     ]
     for t in tests:
         print()
         t()
     print("\n" + "=" * 70)
-    print("All MR-KAN v2.4 Tasks 1-3 tests passed.")
+    print("All MR-KAN v2.4 Tasks 1-4 tests passed.")
     print("=" * 70)
 
 

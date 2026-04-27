@@ -17,7 +17,8 @@ cosine similarity on flattened ``(N, out_features)`` outputs, clamped into
 [0, 1] via ``max(0, sim)`` so the threshold semantic is monotonic.
 """
 
-from typing import Callable
+from dataclasses import dataclass, field
+from typing import Callable, Dict, List, Tuple
 
 import torch
 
@@ -59,3 +60,80 @@ def cosine_similarity_fn(
     # Cosine similarity is bounded in [-1, 1]; clamp negatives to 0 so the
     # metric is monotonically "more similar" (0 = orthogonal, 1 = identical).
     return max(0.0, sim)
+
+
+@dataclass
+class BankPruningStats:
+    """Per-bank record of what was dropped and why."""
+
+    source_layer: int
+    target_layer: int
+    original_K: int
+    surviving_K: int
+    dropped_indices: List[int]
+    surviving_indices: List[int]
+    similarity_matrix: torch.Tensor        # [K, K] original size
+    triggering_pairs: List[Tuple[int, int, float]]  # (i, j, sim) that drove drops
+
+
+@dataclass
+class PruningStats:
+    """Top-level pruning record returned by ``MRKAN.prune``."""
+
+    threshold: float
+    similarity_fn_name: str
+    banks: Dict[Tuple[int, int], BankPruningStats]
+    items_dropped: int
+    items_kept: int
+    params_before: int
+    params_after: int
+
+
+def resolve_pruning(
+    sim_matrix: torch.Tensor,
+    threshold: float,
+) -> Tuple[List[int], List[int], List[Tuple[int, int, float]]]:
+    """Iterative pairwise greedy clustering for one bank's similarity matrix.
+
+    Walks all upper-triangle pairs sorted by similarity descending. For each
+    pair (i, j) with sim > threshold and j > i, if both items are still alive
+    AND dropping j would not violate the >=1-per-bank guard, marks j dropped.
+    Lower-index always survives in a tie.
+
+    Args:
+        sim_matrix: square symmetric tensor [K, K] with 1.0s on diagonal.
+        threshold: float in [0, 1]; pairs with sim > threshold are candidates.
+
+    Returns:
+        (dropped_indices, surviving_indices, triggering_pairs) where:
+        - dropped_indices: sorted list of item indices to remove
+        - surviving_indices: sorted list of item indices to keep
+        - triggering_pairs: list of (i, j, sim) that drove drop decisions
+    """
+    K = sim_matrix.size(0)
+    if K <= 1:
+        return [], list(range(K)), []
+
+    pairs = []
+    for i in range(K):
+        for j in range(i + 1, K):
+            sim = float(sim_matrix[i, j])
+            if sim > threshold:
+                pairs.append((i, j, sim))
+
+    pairs.sort(key=lambda x: x[2], reverse=True)
+
+    alive = set(range(K))
+    triggering: List[Tuple[int, int, float]] = []
+
+    for i, j, sim in pairs:
+        if i not in alive or j not in alive:
+            continue
+        if len(alive) <= 1:
+            break
+        alive.discard(j)
+        triggering.append((i, j, sim))
+
+    dropped = sorted(set(range(K)) - alive)
+    surviving = sorted(alive)
+    return dropped, surviving, triggering

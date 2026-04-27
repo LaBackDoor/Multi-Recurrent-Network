@@ -427,9 +427,103 @@ def test_t6_bank_shrink_with_rcu():
     print("  [t6.3] shrink with RCU: PASS")
 
 
+def test_t7_prune_returns_model_and_stats():
+    """prune returns a tuple of (MRKAN, PruningStats)."""
+    from src.model.kan.pruning import PruningStats
+    model = MRKAN(
+        nn_structure=[6, 12, 1],
+        memory_structure=[2, 2, 2],
+        device=torch.device("cpu"),
+    )
+    out = model.prune(threshold=1.0)
+    assert isinstance(out, tuple) and len(out) == 2
+    pruned, stats = out
+    assert isinstance(pruned, MRKAN)
+    assert isinstance(stats, PruningStats)
+    print("  [t7.1] prune returns (MRKAN, PruningStats): PASS")
+
+
+def test_t7_trivial_threshold_one_no_drops():
+    """threshold=1.0 means only sim>1.0 triggers drops; nothing drops."""
+    model = MRKAN(
+        nn_structure=[6, 12, 1],
+        memory_structure=[3, 2, 3],
+        device=torch.device("cpu"),
+    )
+    pruned, stats = model.prune(threshold=1.0)
+    assert pruned.cell.memory_structure == model.cell.memory_structure
+    assert stats.items_dropped == 0
+    print("  [t7.2] threshold=1.0: no drops: PASS")
+
+
+def test_t7_aggressive_threshold_respects_guard():
+    """threshold=-1 drops everything except the lowest-index item per bank."""
+    model = MRKAN(
+        nn_structure=[6, 12, 1],
+        memory_structure=[3, 2, 4],
+        device=torch.device("cpu"),
+    )
+    pruned, stats = model.prune(threshold=-1.0)
+    expected_new = [1, 1, 1]
+    assert pruned.cell.memory_structure[:3] == expected_new
+    expected_drops = (3 - 1) + (2 - 1) + (4 - 1)
+    assert stats.items_dropped == expected_drops, (
+        f"expected {expected_drops}, got {stats.items_dropped}"
+    )
+    print("  [t7.3] threshold=-1: guard keeps 1 per bank: PASS")
+
+
+def test_t7_cloned_twins_drop_higher_index():
+    """Items 0 and 2 with identical weights; pruning at 0.99 drops item 2."""
+    torch.manual_seed(0)
+    model = MRKAN(
+        nn_structure=[8, 16, 1],
+        memory_structure=[0, 4, 0],
+        device=torch.device("cpu"),
+    )
+    bank = model.cell.memory_banks["1"]
+    per_item = bank.memory_kans["1"]
+    per_item[2].load_state_dict(per_item[0].state_dict())
+
+    refs = {1: torch.randn(64, 16)}
+    pruned, stats = model.prune(threshold=0.99, reference_inputs=refs)
+
+    bank_stats = stats.banks[(1, 1)]
+    assert bank_stats.dropped_indices == [2], bank_stats.dropped_indices
+    assert bank_stats.surviving_indices == [0, 1, 3]
+    print("  [t7.4] cloned twins: drop higher-index: PASS")
+
+
+def test_t7_param_count_matches_new_structure():
+    """Pruned model param count exactly matches what its memory_structure implies."""
+    torch.manual_seed(0)
+    model = MRKAN(
+        nn_structure=[8, 16, 1],
+        memory_structure=[0, 4, 0],
+        device=torch.device("cpu"),
+    )
+    bank = model.cell.memory_banks["1"]
+    per_item = bank.memory_kans["1"]
+    per_item[2].load_state_dict(per_item[0].state_dict())
+
+    refs = {1: torch.randn(64, 16)}
+    pruned, stats = model.prune(threshold=0.99, reference_inputs=refs)
+
+    fresh = MRKAN(
+        nn_structure=[8, 16, 1],
+        memory_structure=pruned.cell.memory_structure[:3],
+        device=torch.device("cpu"),
+    )
+    fresh_count = sum(p.numel() for p in fresh.parameters())
+    pruned_count = sum(p.numel() for p in pruned.parameters())
+    assert fresh_count == pruned_count, (fresh_count, pruned_count)
+    assert stats.params_after == pruned_count
+    print(f"  [t7.5] param count matches structure: {pruned_count} == {fresh_count}: PASS")
+
+
 def main():
     print("=" * 70)
-    print("MR-KAN v2.4 Tasks 1-6 tests")
+    print("MR-KAN v2.4 Tasks 1-7 tests")
     print("=" * 70)
     tests = [
         test_t1_layer_link_ratios_default_matches_v1_formula,
@@ -454,12 +548,17 @@ def main():
         test_t6_bank_shrink_basic,
         test_t6_bank_shrink_preserves_surviving_kan_weights,
         test_t6_bank_shrink_with_rcu,
+        test_t7_prune_returns_model_and_stats,
+        test_t7_trivial_threshold_one_no_drops,
+        test_t7_aggressive_threshold_respects_guard,
+        test_t7_cloned_twins_drop_higher_index,
+        test_t7_param_count_matches_new_structure,
     ]
     for t in tests:
         print()
         t()
     print("\n" + "=" * 70)
-    print("All MR-KAN v2.4 Tasks 1-6 tests passed.")
+    print("All MR-KAN v2.4 Tasks 1-7 tests passed.")
     print("=" * 70)
 
 

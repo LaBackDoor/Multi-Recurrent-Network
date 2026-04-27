@@ -629,3 +629,55 @@ class MRKANCell(nn.Module):
                         mat[j, i] = sim
                 result[(src, tgt)] = mat
         return result
+
+    @torch.no_grad()
+    def prune(
+        self,
+        threshold: float,
+        reference_inputs=None,
+        similarity_fn=None,
+        n_samples: int = 128,
+    ):
+        """Compute drop decisions for all banks. Returns building blocks for MRKAN.prune.
+
+        Returns:
+            (new_memory_structure, bank_decisions, sim_fn_name, items_dropped, items_kept)
+        """
+        from src.model.kan.pruning import (
+            BankPruningStats,
+            cosine_similarity_fn,
+            resolve_pruning,
+        )
+
+        if similarity_fn is None:
+            similarity_fn = cosine_similarity_fn
+        sim_fn_name = getattr(similarity_fn, "__name__", "custom_similarity_fn")
+
+        sims = self.compute_spline_similarities(
+            reference_inputs=reference_inputs,
+            similarity_fn=similarity_fn,
+            n_samples=n_samples,
+        )
+
+        bank_decisions: Dict[Tuple[int, int], BankPruningStats] = {}
+        for (src, tgt), sim_mat in sims.items():
+            dropped, surviving, triggering = resolve_pruning(sim_mat, threshold)
+            bank_decisions[(src, tgt)] = BankPruningStats(
+                source_layer=src,
+                target_layer=tgt,
+                original_K=sim_mat.size(0),
+                surviving_K=len(surviving),
+                dropped_indices=dropped,
+                surviving_indices=surviving,
+                similarity_matrix=sim_mat,
+                triggering_pairs=triggering,
+            )
+
+        new_memory_structure = list(self.memory_structure)
+        for (src, _), bp in bank_decisions.items():
+            new_memory_structure[src] = bp.surviving_K
+
+        items_dropped = sum(bp.original_K - bp.surviving_K for bp in bank_decisions.values())
+        items_kept = sum(bp.surviving_K for bp in bank_decisions.values())
+
+        return new_memory_structure, bank_decisions, sim_fn_name, items_dropped, items_kept

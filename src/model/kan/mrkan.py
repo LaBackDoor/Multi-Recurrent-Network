@@ -191,6 +191,97 @@ class MRKAN(nn.Module):
         )
 
     @torch.no_grad()
+    def prune(
+        self,
+        threshold: float,
+        reference_inputs=None,
+        similarity_fn=None,
+        n_samples: int = 128,
+    ):
+        """Return a smaller MRKAN with redundant memory items removed.
+
+        Post-training, one-shot, reconstruction-based prune. The original
+        model is untouched.
+
+        Args:
+            threshold: pairs with sim > threshold (lower-index survives) are
+                dropped subject to the >=1-per-bank guard.
+            reference_inputs: optional dict {source_layer: tensor[N, layer_size]}
+                for similarity computation. Missing layers get random samples.
+            similarity_fn: optional custom similarity function; defaults to
+                cosine_similarity_fn.
+            n_samples: N for random reference inputs per source layer.
+
+        Returns:
+            (pruned_model, PruningStats)
+        """
+        import copy
+        from src.model.kan.pruning import PruningStats
+
+        params_before = sum(p.numel() for p in self.parameters())
+
+        new_memory_structure, bank_decisions, sim_fn_name, items_dropped, items_kept = (
+            self.cell.prune(
+                threshold=threshold,
+                reference_inputs=reference_inputs,
+                similarity_fn=similarity_fn,
+                n_samples=n_samples,
+            )
+        )
+
+        pruned = MRKAN(
+            nn_structure=self.nn_structure,
+            memory_structure=new_memory_structure[: len(self.nn_structure)],
+            kan_grid_size=self.cell.kan_grid_size,
+            kan_spline_order=self.cell.kan_spline_order,
+            kan_enable_standalone_scale_spline=self.cell.kan_enable_standalone_scale_spline,
+            kan_base_activation=self.cell.kan_base_activation,
+            kan_use_layernorm=self.cell.kan_use_layernorm,
+            kan_grid_range=self.cell.kan_grid_range,
+            learn_ratios=self.cell.learn_ratios,
+            ratio_control_use_kan=self.cell.ratio_control_use_kan,
+            kan_input_path=self.cell.kan_input_path,
+            kan_output_path=self.cell.kan_output_path,
+            device=self.device,
+        )
+
+        # Transplant feedforward weights and biases (nn_structure is unchanged)
+        for key, p in self.cell.weights.items():
+            pruned.cell.weights[key].data.copy_(p.data)
+        for key, p in self.cell.biases.items():
+            pruned.cell.biases[key].data.copy_(p.data)
+
+        # Deep-copy path KANs (shape is determined by nn_structure, not memory)
+        for key, kan_module in self.cell.kan_layers.items():
+            pruned.cell.kan_layers[key] = copy.deepcopy(kan_module)
+
+        # Surgically replace memory banks
+        external_input_size = self.input_size
+        for src_key, original_bank in self.cell.memory_banks.items():
+            src = int(src_key)
+            tgt_key = next(iter(original_bank.memory_kans.keys()))
+            tgt = int(tgt_key)
+            bank_stat = bank_decisions[(src, tgt)]
+            shrunk = original_bank.shrink(
+                surviving_indices=bank_stat.surviving_indices,
+                external_input_size=external_input_size,
+            )
+            pruned.cell.memory_banks[src_key] = shrunk
+
+        params_after = sum(p.numel() for p in pruned.parameters())
+
+        stats = PruningStats(
+            threshold=threshold,
+            similarity_fn_name=sim_fn_name,
+            banks=bank_decisions,
+            items_dropped=items_dropped,
+            items_kept=items_kept,
+            params_before=params_before,
+            params_after=params_after,
+        )
+        return pruned, stats
+
+    @torch.no_grad()
     def calibrate_grids(
         self,
         dataloader: Iterable,

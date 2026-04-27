@@ -370,9 +370,66 @@ def test_t5_rcu_shrink_weights_correctly_sliced():
     print("  [t5.3] base_weight, spline_weight, grid correctly sliced: PASS")
 
 
+def test_t6_bank_shrink_basic():
+    """Shrunk bank has correct num_items, layer_link_ratios, and surviving KANLinears."""
+    bank = KANMemoryBank(
+        num_items=4,
+        layer_size=10,
+        target_layer_sizes={1: 20},
+        device=torch.device("cpu"),
+    )
+    new_bank = bank.shrink(surviving_indices=[0, 2, 3], external_input_size=8)
+    assert new_bank.num_items == 3
+    expected_ratios = torch.tensor([0.25, 0.75, 1.00])
+    assert torch.allclose(new_bank.layer_link_ratios, expected_ratios, atol=1e-5)
+    assert bank.num_items == 4  # original untouched
+    print("  [t6.1] basic shrink: PASS")
+
+
+def test_t6_bank_shrink_preserves_surviving_kan_weights():
+    """Surviving items in shrunk bank have identical weights to original (deep copy)."""
+    bank = KANMemoryBank(
+        num_items=4,
+        layer_size=8,
+        target_layer_sizes={1: 12},
+        device=torch.device("cpu"),
+    )
+    surviving = [1, 3]
+    new_bank = bank.shrink(surviving_indices=surviving, external_input_size=6)
+
+    for new_idx, old_idx in enumerate(surviving):
+        old_kan = bank.memory_kans["1"][old_idx]
+        new_kan = new_bank.memory_kans["1"][new_idx]
+        for key in old_kan.state_dict():
+            assert torch.allclose(
+                old_kan.state_dict()[key], new_kan.state_dict()[key]
+            ), f"weight {key} differs at new_idx={new_idx}"
+    print("  [t6.2] surviving KAN weights preserved: PASS")
+
+
+def test_t6_bank_shrink_with_rcu():
+    """When learn_ratios=True, the shrunk bank has a surgically-rebuilt RCU."""
+    bank = KANMemoryBank(
+        num_items=4,
+        layer_size=10,
+        target_layer_sizes={1: 20},
+        learn_ratios=True,
+        ratio_input_size=8,
+        device=torch.device("cpu"),
+    )
+    assert bank.rcu is not None
+
+    new_bank = bank.shrink(surviving_indices=[0, 2], external_input_size=8)
+    assert new_bank.rcu is not None
+    assert new_bank.rcu.num_items == 2
+    assert new_bank.rcu.input_size == 8
+    assert new_bank.rcu.memory_size == 2 * 10
+    print("  [t6.3] shrink with RCU: PASS")
+
+
 def main():
     print("=" * 70)
-    print("MR-KAN v2.4 Tasks 1-5 tests")
+    print("MR-KAN v2.4 Tasks 1-6 tests")
     print("=" * 70)
     tests = [
         test_t1_layer_link_ratios_default_matches_v1_formula,
@@ -394,12 +451,15 @@ def main():
         test_t5_rcu_shrink_kan_backend_shape,
         test_t5_rcu_shrink_linear_backend_shape,
         test_t5_rcu_shrink_weights_correctly_sliced,
+        test_t6_bank_shrink_basic,
+        test_t6_bank_shrink_preserves_surviving_kan_weights,
+        test_t6_bank_shrink_with_rcu,
     ]
     for t in tests:
         print()
         t()
     print("\n" + "=" * 70)
-    print("All MR-KAN v2.4 Tasks 1-5 tests passed.")
+    print("All MR-KAN v2.4 Tasks 1-6 tests passed.")
     print("=" * 70)
 
 

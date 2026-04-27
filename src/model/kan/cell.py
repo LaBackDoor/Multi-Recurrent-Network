@@ -265,6 +265,71 @@ class KANMemoryBank(nn.Module):
         return ratios * new_act_expanded + (1.0 - ratios) * memory
 
 
+    @torch.no_grad()
+    def shrink(
+        self,
+        surviving_indices: list,
+        external_input_size: int,
+    ) -> "KANMemoryBank":
+        """Return a new KANMemoryBank containing only the surviving items.
+
+        Original bank is untouched. The new bank:
+        - Has num_items = len(surviving_indices)
+        - Inherits all KAN config from self
+        - Has layer_link_ratios sliced to surviving items' original values
+        - Deep-copies surviving KANLinears for memory_kans
+        - Surgically rebuilds the RCU when self.rcu is not None
+
+        Args:
+            surviving_indices: sorted list of item indices to keep.
+            external_input_size: width of the external input I_t (passed to
+                RCU.shrink when self.rcu is not None; ignored otherwise).
+
+        Returns:
+            A new KANMemoryBank with surgical state.
+        """
+        import copy
+
+        new_K = len(surviving_indices)
+        new_ratios = self.layer_link_ratios[
+            torch.tensor(surviving_indices, dtype=torch.long)
+        ].clone()
+
+        new_bank = KANMemoryBank(
+            num_items=new_K,
+            layer_size=self.layer_size,
+            target_layer_sizes=dict(self.target_layer_sizes),
+            kan_grid_size=self._kan_grid_size,
+            kan_spline_order=self._kan_spline_order,
+            kan_enable_standalone_scale_spline=self._kan_enable_standalone_scale_spline,
+            kan_base_activation=self._kan_base_activation,
+            kan_use_layernorm=self._kan_use_layernorm,
+            kan_grid_range=self._kan_grid_range,
+            init_memory_mode=self.init_memory_mode,
+            init_memory_value=self.init_memory_value,
+            learn_ratios=(self.rcu is not None),
+            ratio_input_size=external_input_size if self.rcu is not None else None,
+            ratio_control_use_kan=self._ratio_control_use_kan,
+            custom_ratios=new_ratios,
+            device=self.device,
+        )
+
+        # Replace freshly-init'd memory_kans with deep-copies of surviving items
+        for tgt_key, per_item in self.memory_kans.items():
+            new_bank.memory_kans[tgt_key] = nn.ModuleList(
+                [copy.deepcopy(per_item[i]) for i in surviving_indices]
+            )
+
+        if self.rcu is not None:
+            new_bank.rcu = self.rcu.shrink(
+                surviving_indices=surviving_indices,
+                layer_size=self.layer_size,
+                external_input_size=external_input_size,
+            )
+
+        return new_bank
+
+
 class MRKANCell(nn.Module):
     """MR-KAN cell with v1 + v2 features.
 

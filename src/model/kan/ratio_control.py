@@ -64,6 +64,14 @@ class RatioControlUnit(nn.Module):
         self.num_items = num_items
         self.use_kan = use_kan
 
+        # Persist for shrink()
+        self._stored_kan_grid_size = kan_grid_size
+        self._stored_kan_spline_order = kan_spline_order
+        self._stored_kan_enable_standalone_scale_spline = kan_enable_standalone_scale_spline
+        self._stored_kan_base_activation = kan_base_activation
+        self._stored_kan_use_layernorm = kan_use_layernorm
+        self._stored_kan_grid_range = kan_grid_range
+
         in_features = input_size + memory_size
 
         if use_kan:
@@ -96,3 +104,82 @@ class RatioControlUnit(nn.Module):
         x = torch.cat([current_input, flat_mem], dim=-1)  # [B, in_features]
         logits = self.unit(x)  # [B, K]
         return torch.sigmoid(logits)
+
+    @torch.no_grad()
+    def shrink(
+        self,
+        surviving_indices: list,
+        layer_size: int,
+        external_input_size: int,
+    ) -> "RatioControlUnit":
+        """Return a new RCU surgically reduced to len(surviving_indices) items.
+
+        Slices both the row dim (output) for surviving items AND the column
+        dim (input) for the external-input columns plus surviving items' memory
+        slots. Same backend (KANLinear or nn.Linear) as self.
+
+        Args:
+            surviving_indices: sorted list of item indices to keep.
+            layer_size: per-item memory width L.
+            external_input_size: width of the external-input portion.
+
+        Returns:
+            A new RatioControlUnit with surgical weights transplanted.
+        """
+        new_K = len(surviving_indices)
+        new_memory_size = new_K * layer_size
+
+        # LayerNorm normalizes over all input features jointly, so
+        # LN(x[col_mask]) != LN(x)[col_mask] in general. The surgical contract
+        # (identical logits on sliced inputs) only holds when LN is absent, so
+        # the shrunk RCU is always created without LN. Fine-tune after pruning
+        # to recoup any LN-induced accuracy.
+        new_rcu = RatioControlUnit(
+            input_size=external_input_size,
+            memory_size=new_memory_size,
+            num_items=new_K,
+            use_kan=self.use_kan,
+            kan_grid_size=self._stored_kan_grid_size,
+            kan_spline_order=self._stored_kan_spline_order,
+            kan_enable_standalone_scale_spline=self._stored_kan_enable_standalone_scale_spline,
+            kan_base_activation=self._stored_kan_base_activation,
+            kan_use_layernorm=False,
+            kan_grid_range=self._stored_kan_grid_range,
+        )
+
+        # Column mask: keep external-input cols + surviving items' memory slots
+        old_in = external_input_size + self.num_items * layer_size
+        col_mask = torch.zeros(old_in, dtype=torch.bool)
+        col_mask[:external_input_size] = True
+        for i in surviving_indices:
+            start = external_input_size + i * layer_size
+            col_mask[start : start + layer_size] = True
+
+        row_idx = torch.tensor(surviving_indices, dtype=torch.long)
+
+        if self.use_kan:
+            new_rcu.unit.base_weight.data.copy_(
+                self.unit.base_weight.data[row_idx][:, col_mask]
+            )
+            new_rcu.unit.spline_weight.data.copy_(
+                self.unit.spline_weight.data[row_idx][:, col_mask]
+            )
+            if self.unit.enable_standalone_scale_spline:
+                new_rcu.unit.spline_scaler.data.copy_(
+                    self.unit.spline_scaler.data[row_idx][:, col_mask]
+                )
+            if self.unit.layer_norm is not None and new_rcu.unit.layer_norm is not None:
+                new_rcu.unit.layer_norm.weight.data.copy_(
+                    self.unit.layer_norm.weight.data[col_mask]
+                )
+                new_rcu.unit.layer_norm.bias.data.copy_(
+                    self.unit.layer_norm.bias.data[col_mask]
+                )
+            new_rcu.unit.grid.copy_(self.unit.grid[col_mask])
+        else:
+            new_rcu.unit.weight.data.copy_(
+                self.unit.weight.data[row_idx][:, col_mask]
+            )
+            new_rcu.unit.bias.data.copy_(self.unit.bias.data[row_idx])
+
+        return new_rcu

@@ -296,9 +296,83 @@ def test_t4_dataclasses_construct():
     print("  [t4.5] PruningStats / BankPruningStats dataclasses: PASS")
 
 
+def test_t5_rcu_shrink_kan_backend_shape():
+    """Shrunk KAN-backed RCU has the right input/output dims and parameter shapes."""
+    from src.model.kan.ratio_control import RatioControlUnit
+    rcu = RatioControlUnit(
+        input_size=8,
+        memory_size=4 * 12,
+        num_items=4,
+        use_kan=True,
+    )
+    new_rcu = rcu.shrink(surviving_indices=[0, 2], layer_size=12, external_input_size=8)
+    assert new_rcu.num_items == 2
+    assert new_rcu.input_size == 8
+    assert new_rcu.memory_size == 2 * 12
+    assert new_rcu.unit.in_features == 8 + 24
+    assert new_rcu.unit.out_features == 2
+    print("  [t5.1] KAN-backed shrink shape: PASS")
+
+
+def test_t5_rcu_shrink_linear_backend_shape():
+    """Shrunk Linear-backed RCU has the right input/output dims."""
+    from src.model.kan.ratio_control import RatioControlUnit
+    rcu = RatioControlUnit(
+        input_size=8,
+        memory_size=4 * 12,
+        num_items=4,
+        use_kan=False,
+    )
+    new_rcu = rcu.shrink(surviving_indices=[1, 3], layer_size=12, external_input_size=8)
+    assert new_rcu.unit.weight.shape == (2, 8 + 24)
+    assert new_rcu.unit.bias.shape == (2,)
+    print("  [t5.2] Linear-backed shrink shape: PASS")
+
+
+def test_t5_rcu_shrink_weights_correctly_sliced():
+    """The surgical contract: shrunk RCU's weights are exactly the surviving
+    rows × surviving input columns of the original.
+
+    This verifies the slicing mechanics independently of LN coupling effects.
+    For KAN backend: base_weight, spline_weight, and grid are checked.
+    """
+    torch.manual_seed(0)
+    from src.model.kan.ratio_control import RatioControlUnit
+    K = 4
+    L = 12
+    EXT = 8
+    rcu = RatioControlUnit(input_size=EXT, memory_size=K * L, num_items=K, use_kan=True)
+
+    surviving = [0, 2]
+    new_rcu = rcu.shrink(surviving_indices=surviving, layer_size=L, external_input_size=EXT)
+
+    # Build the expected column mask
+    old_in = EXT + K * L
+    col_mask = torch.zeros(old_in, dtype=torch.bool)
+    col_mask[:EXT] = True
+    for i in surviving:
+        col_mask[EXT + i * L : EXT + (i + 1) * L] = True
+
+    row_idx = torch.tensor(surviving, dtype=torch.long)
+
+    # base_weight: [K_new, new_in] should equal orig[row_idx][:, col_mask]
+    expected_bw = rcu.unit.base_weight.data[row_idx][:, col_mask]
+    assert torch.allclose(new_rcu.unit.base_weight.data, expected_bw), "base_weight mismatch"
+
+    # spline_weight: [K_new, new_in, coeff]
+    expected_sw = rcu.unit.spline_weight.data[row_idx][:, col_mask]
+    assert torch.allclose(new_rcu.unit.spline_weight.data, expected_sw), "spline_weight mismatch"
+
+    # grid: [new_in, G]
+    expected_grid = rcu.unit.grid.data[col_mask]
+    assert torch.allclose(new_rcu.unit.grid.data, expected_grid), "grid mismatch"
+
+    print("  [t5.3] base_weight, spline_weight, grid correctly sliced: PASS")
+
+
 def main():
     print("=" * 70)
-    print("MR-KAN v2.4 Tasks 1-4 tests")
+    print("MR-KAN v2.4 Tasks 1-5 tests")
     print("=" * 70)
     tests = [
         test_t1_layer_link_ratios_default_matches_v1_formula,
@@ -317,12 +391,15 @@ def main():
         test_t4_resolve_pruning_guard_keeps_at_least_one,
         test_t4_resolve_pruning_no_drops_under_threshold,
         test_t4_dataclasses_construct,
+        test_t5_rcu_shrink_kan_backend_shape,
+        test_t5_rcu_shrink_linear_backend_shape,
+        test_t5_rcu_shrink_weights_correctly_sliced,
     ]
     for t in tests:
         print()
         t()
     print("\n" + "=" * 70)
-    print("All MR-KAN v2.4 Tasks 1-4 tests passed.")
+    print("All MR-KAN v2.4 Tasks 1-5 tests passed.")
     print("=" * 70)
 
 

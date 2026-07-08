@@ -27,3 +27,8 @@ torch = [
 torchvision = [
   { index = "pytorch-cu130", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]
+
+[dependency-groups]
+test = [
+    "pytest>=9.1.1",
+]

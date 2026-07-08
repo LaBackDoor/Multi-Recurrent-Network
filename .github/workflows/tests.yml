@@ -16,14 +16,12 @@ jobs:
         with:
           version: "latest"
 
-      - name: Set up Python
-        run: uv python install 3.11
-
-      - name: Install dependencies
-        run: |
-          uv pip install --system torch --index-url https://download.pytorch.org/whl/cpu
-          uv pip install --system pytest numpy scikit-learn pandas matplotlib seaborn
-          uv pip install --system -e . --no-deps
+      - name: Install dependencies (CPU torch via test group)
+        # UV_INDEX_PYTORCH_CU130 redirects the named pytorch-cu130 index to
+        # CPU wheels at runtime — same lock file, no CUDA drivers needed in CI.
+        run: uv sync --group test
+        env:
+          UV_INDEX_PYTORCH_CU130: https://download.pytorch.org/whl/cpu
 
       - name: Run tests
-        run: pytest test/ -v --tb=short
+        run: uv run pytest test/ -v --tb=short

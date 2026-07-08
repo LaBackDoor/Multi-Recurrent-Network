@@ -119,10 +119,16 @@ class MemoryBank(nn.Module):
         Per self.init_memory_mode: "random" (uniform [0, 1), matches the thesis
         text) or "constant" (filled with init_memory_value, matches NumPy).
         """
+        # Follow the module's live parameter device rather than the
+        # construction-time self.device, so `model.to(device)` keeps working.
+        try:
+            device = next(self.parameters()).device
+        except StopIteration:
+            device = self.device
         shape = (batch_size, self.num_items, self.layer_size)
         if self.init_memory_mode == "random":
-            return torch.rand(*shape, device=self.device)
-        return torch.full(shape, self.init_memory_value, device=self.device)
+            return torch.rand(*shape, device=device)
+        return torch.full(shape, self.init_memory_value, device=device)
 
     def compute_context(
         self, memory: torch.Tensor, target_layer: int
@@ -218,6 +224,12 @@ class MRNCell(nn.Module):
         if len(nn_structure) < 3:
             raise ValueError(
                 f"nn_structure must have at least 3 layers, got {len(nn_structure)}"
+            )
+        if len(memory_structure) > len(nn_structure):
+            raise ValueError(
+                f"memory_structure has {len(memory_structure)} entries but "
+                f"nn_structure only has {len(nn_structure)} layers; the extra "
+                f"entries would be silently ignored"
             )
 
         self.nn_structure = list(nn_structure)

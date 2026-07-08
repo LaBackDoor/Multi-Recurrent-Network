@@ -14,7 +14,8 @@ Original author: Blealtan. Vendored verbatim with two additions:
 
 Defaults are tuned for recurrent use: grid_size=3, spline_order=3, and
 ``enable_standalone_scale_spline=False`` to keep the parameter footprint near
-~5x a plain nn.Linear rather than ~10x.
+~7x a plain nn.Linear (6 spline coefficients + 1 base weight per edge) rather
+than the ~10x of efficient-kan's stock defaults.
 
 ``update_grid`` is preserved from the original but is not wired into forward;
 calling it mid-sequence breaks BPTT because of the @torch.no_grad() decorator
@@ -252,6 +253,19 @@ class KANLinear(torch.nn.Module):
                 ).unsqueeze(1),
             ],
             dim=0,
+        )
+
+        # (Near-)constant features - or fp32 rounding at large magnitudes -
+        # can leave adjacent knots identical, which zeroes the Cox-de Boor
+        # denominators in b_splines and floods the forward pass with NaNs.
+        # Rebuild the grid from consecutive spacings clamped to a scale-aware
+        # minimum so knots stay strictly increasing.
+        finfo = torch.finfo(grid.dtype)
+        scale = grid.abs().amax(dim=0, keepdim=True)
+        min_spacing = torch.clamp(16.0 * finfo.eps * scale, min=1e-6)
+        spacing = torch.maximum(grid.diff(dim=0), min_spacing)
+        grid = torch.concatenate(
+            [grid[:1], grid[:1] + torch.cumsum(spacing, dim=0)], dim=0
         )
 
         self.grid.copy_(grid.T)

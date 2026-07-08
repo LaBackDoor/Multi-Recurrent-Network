@@ -4,7 +4,7 @@ v2 adds three orthogonal toggles plus a ``calibrate_grids`` helper. All toggles
 default to off so v1 behavior is preserved.
 """
 
-from typing import Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import torch
 from torch import nn
@@ -164,27 +164,106 @@ class MRKAN(nn.Module):
         self.cell.update_grids(calibration_inputs)
 
     @torch.no_grad()
+    def collect_memory_references(
+        self,
+        dataloader: Iterable,
+        n_batches: int = 4,
+        max_samples_per_layer: int = 1024,
+        device: Optional[torch.device] = None,
+    ) -> Dict[int, torch.Tensor]:
+        """Collect evolved memory states to use as similarity reference inputs.
+
+        Rolls the cell over ``n_batches`` of real data (memory updates forced
+        on) and records every post-update memory item as a [*, layer_size]
+        row. This is the distribution the memory KANs actually see at run
+        time, which is what spline-shape similarity should be measured on -
+        random reference inputs probe spline regions that training never
+        visited and can flip pruning decisions.
+
+        Args:
+            dataloader: iterable yielding ``Tensor`` batches or ``(inputs,
+                ...)`` tuples, shaped ``[B, T, input_size]`` or
+                ``[T, input_size]`` like training data.
+            n_batches: batches to roll before subsampling.
+            max_samples_per_layer: cap on reference rows per source layer
+                (random subsample above this).
+            device: where to run collection; defaults to the model's device.
+
+        Returns:
+            dict {source_layer: tensor[N, layer_size]} suitable for the
+            ``reference_inputs`` argument of ``compute_spline_similarities``
+            and ``prune``.
+        """
+        was_training = self.training
+        prev_update_memory = self.cell._update_memory_flag
+        self.eval()
+        self.set_update_memory(True)
+        try:
+            device = device or next(self.parameters()).device
+            records: Dict[int, list] = {
+                int(k): [] for k in self.cell.memory_banks.keys()
+            }
+            for i, batch in enumerate(dataloader):
+                if i >= n_batches:
+                    break
+                x = batch[0] if isinstance(batch, (list, tuple)) else batch
+                x = x.to(device)
+                if x.dim() == 2:
+                    x = x.unsqueeze(0)
+                state = self.cell.init_state(batch_size=x.shape[0])
+                for t in range(x.shape[1]):
+                    _, _, state = self.cell(x[:, t], state)
+                    for src, mem in state.memory_banks.items():
+                        records[src].append(mem.reshape(-1, mem.shape[-1]))
+            refs: Dict[int, torch.Tensor] = {}
+            for src, rows in records.items():
+                if not rows:
+                    continue
+                stacked = torch.cat(rows, dim=0)
+                if stacked.shape[0] > max_samples_per_layer:
+                    keep = torch.randperm(stacked.shape[0], device=stacked.device)
+                    stacked = stacked[keep[:max_samples_per_layer]]
+                refs[src] = stacked
+            return refs
+        finally:
+            self.set_update_memory(prev_update_memory)
+            if was_training:
+                self.train()
+
+    @torch.no_grad()
     def compute_spline_similarities(
         self,
         reference_inputs=None,
         similarity_fn=None,
         n_samples: int = 128,
+        dataloader: Optional[Iterable] = None,
+        n_batches: int = 4,
     ):
         """Per-bank KxK pairwise similarity matrices over memory items.
 
         Args:
             reference_inputs: optional dict mapping source-layer index to a
                 2D tensor [N, layer_size] of reference inputs to feed each
-                KANLinear in that bank. Layers absent from this dict get
-                fresh ``torch.randn(n_samples, layer_size)`` per call.
+                KANLinear in that bank. Prefer real evolved states (see
+                ``collect_memory_references`` / the ``dataloader`` arg).
             similarity_fn: callable matching the SimilarityFn contract from
                 ``src.model.kan.pruning``. Defaults to cosine similarity.
-            n_samples: N when reference_inputs is None for a source layer.
+            n_samples: N for the fallback references of layers absent from
+                ``reference_inputs``: fresh ``torch.rand(n_samples,
+                layer_size)`` per call, matching the (0, 1) support of
+                memory states.
+            dataloader: when given and ``reference_inputs`` is None, real
+                references are collected via ``collect_memory_references``.
+            n_batches: batches used by that collection.
 
         Returns:
             dict {(source_layer, target_layer): tensor[K, K]}. Diagonal is
             1.0 by construction (item identical to itself).
         """
+        if reference_inputs is None and dataloader is not None:
+            reference_inputs = self.collect_memory_references(
+                dataloader, n_batches=n_batches
+            )
         return self.cell.compute_spline_similarities(
             reference_inputs=reference_inputs,
             similarity_fn=similarity_fn,
@@ -198,6 +277,8 @@ class MRKAN(nn.Module):
         reference_inputs=None,
         similarity_fn=None,
         n_samples: int = 128,
+        dataloader: Optional[Iterable] = None,
+        n_batches: int = 4,
     ):
         """Return a smaller MRKAN with redundant memory items removed.
 
@@ -208,16 +289,27 @@ class MRKAN(nn.Module):
             threshold: pairs with sim > threshold (lower-index survives) are
                 dropped subject to the >=1-per-bank guard.
             reference_inputs: optional dict {source_layer: tensor[N, layer_size]}
-                for similarity computation. Missing layers get random samples.
+                for similarity computation. Prefer real evolved states (see
+                ``collect_memory_references``); layers missing from the dict
+                fall back to uniform [0, 1) samples.
             similarity_fn: optional custom similarity function; defaults to
                 cosine_similarity_fn.
-            n_samples: N for random reference inputs per source layer.
+            n_samples: N for fallback reference inputs per source layer.
+            dataloader: when given and ``reference_inputs`` is None, real
+                references are collected from it before pruning. This is the
+                recommended way to call prune.
+            n_batches: batches used by that collection.
 
         Returns:
             (pruned_model, PruningStats)
         """
         import copy
         from src.model.kan.pruning import PruningStats
+
+        if reference_inputs is None and dataloader is not None:
+            reference_inputs = self.collect_memory_references(
+                dataloader, n_batches=n_batches
+            )
 
         params_before = sum(p.numel() for p in self.parameters())
 
@@ -233,6 +325,10 @@ class MRKAN(nn.Module):
         pruned = MRKAN(
             nn_structure=self.nn_structure,
             memory_structure=new_memory_structure[: len(self.nn_structure)],
+            weight_init_range=self.cell.weight_init_range,
+            hidden_bias_init_value=self.cell.hidden_bias_init_value,
+            init_memory_mode=self.cell.init_memory_mode,
+            init_memory_value=self.cell.init_memory_value,
             kan_grid_size=self.cell.kan_grid_size,
             kan_spline_order=self.cell.kan_spline_order,
             kan_enable_standalone_scale_spline=self.cell.kan_enable_standalone_scale_spline,
@@ -243,8 +339,9 @@ class MRKAN(nn.Module):
             ratio_control_use_kan=self.cell.ratio_control_use_kan,
             kan_input_path=self.cell.kan_input_path,
             kan_output_path=self.cell.kan_output_path,
-            device=self.device,
+            device=next(self.parameters()).device,
         )
+        pruned.set_update_memory(self.cell._update_memory_flag)
 
         # Transplant feedforward weights and biases (nn_structure is unchanged)
         for key, p in self.cell.weights.items():
@@ -298,11 +395,15 @@ class MRKAN(nn.Module):
 
         Pattern (run between epochs, never inside a training loop):
 
-        1. Switch to eval, freeze memory updates.
+        1. Switch to eval. Memory updates stay ENABLED: memory lives in the
+           ephemeral state (never in the module), so letting it evolve
+           mutates nothing persistent - while freezing it would show every
+           memory KAN only the freshly-initialised memory and fit the grids
+           to the init distribution instead of the run-time one.
         2. Hook every KANLinear and collect its forward inputs.
         3. Run ``n_batches`` forward passes on the dataloader.
         4. Call ``update_grid`` on each KANLinear with its collected samples.
-        5. Restore train/memory-update modes.
+        5. Restore the caller's train/memory-update modes.
 
         ``update_grid`` is ``@torch.no_grad()`` and writes in place to the
         knot grid and refits spline_weight via least-squares; this would
@@ -321,10 +422,11 @@ class MRKAN(nn.Module):
                 Defaults to ``self.device``.
         """
         was_training = self.training
-        device = device or self.device
+        prev_update_memory = self.cell._update_memory_flag
+        device = device or next(self.parameters()).device
 
         self.eval()
-        self.set_update_memory(False)
+        self.set_update_memory(True)
 
         try:
             collected: dict[int, list[torch.Tensor]] = {}
@@ -367,6 +469,6 @@ class MRKAN(nn.Module):
                 # already reshaped to that.
                 module.update_grid(x)
         finally:
-            self.set_update_memory(True)
+            self.set_update_memory(prev_update_memory)
             if was_training:
                 self.train()

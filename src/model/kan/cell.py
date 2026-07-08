@@ -190,10 +190,14 @@ class KANMemoryBank(nn.Module):
 
     def init_memory(self, batch_size: int) -> torch.Tensor:
         """Initial memory tensor of shape [B, num_items, layer_size]."""
+        # Follow the module's live device (the layer_link_ratios buffer moves
+        # with .to()) rather than the construction-time self.device, so
+        # `model.to(device)` keeps working.
+        device = self.layer_link_ratios.device
         shape = (batch_size, self.num_items, self.layer_size)
         if self.init_memory_mode == "random":
-            return torch.rand(*shape, device=self.device)
-        return torch.full(shape, self.init_memory_value, device=self.device)
+            return torch.rand(*shape, device=device)
+        return torch.full(shape, self.init_memory_value, device=device)
 
     def compute_context(
         self, memory: torch.Tensor, target_layer: int
@@ -290,6 +294,12 @@ class KANMemoryBank(nn.Module):
         """
         import copy
 
+        # No-drop shrink must be an identity: rebuilding the RCU would strip
+        # its LayerNorm (see RatioControlUnit.shrink) and change behavior even
+        # though nothing was pruned from this bank.
+        if list(surviving_indices) == list(range(self.num_items)):
+            return copy.deepcopy(self)
+
         new_K = len(surviving_indices)
         new_ratios = self.layer_link_ratios[
             torch.tensor(surviving_indices, dtype=torch.long)
@@ -311,7 +321,7 @@ class KANMemoryBank(nn.Module):
             ratio_input_size=external_input_size if self.rcu is not None else None,
             ratio_control_use_kan=self._ratio_control_use_kan,
             custom_ratios=new_ratios,
-            device=self.device,
+            device=self.layer_link_ratios.device,
         )
 
         # Replace freshly-init'd memory_kans with deep-copies of surviving items
@@ -365,6 +375,12 @@ class MRKANCell(nn.Module):
         if len(nn_structure) < 3:
             raise ValueError(
                 f"nn_structure must have at least 3 layers, got {len(nn_structure)}"
+            )
+        if len(memory_structure) > len(nn_structure):
+            raise ValueError(
+                f"memory_structure has {len(memory_structure)} entries but "
+                f"nn_structure only has {len(nn_structure)} layers; the extra "
+                f"entries would be silently ignored"
             )
 
         self.nn_structure = list(nn_structure)
@@ -471,6 +487,13 @@ class MRKANCell(nn.Module):
                     ratio_control_use_kan=ratio_control_use_kan,
                     device=self.device,
                 )
+
+        # Path KANs (kan_layers) are plain sub-modules with no device arg, so
+        # they are born on the default device; move the whole cell so every
+        # component lands on self.device. (KANLinear init runs lstsq, which
+        # some accelerators lack - constructing on CPU first then moving is
+        # the safe order.)
+        self.to(self.device)
 
     def _chain_target(self, source_layer: int) -> int:
         """Chain topology rule (from the MRN README). For 3-layer networks
@@ -618,9 +641,18 @@ class MRKANCell(nn.Module):
         result: Dict[Tuple[int, int], torch.Tensor] = {}
         for src_key, bank in self.memory_banks.items():
             src = int(src_key)
-            refs = reference_inputs.get(
-                src, torch.randn(n_samples, bank.layer_size, device=self.device)
-            )
+            # Fallback refs are uniform [0, 1): memory items are convex blends
+            # of sigmoid activations / scaled inputs, so (0, 1) is the right
+            # support. randn would probe regions the splines never see. Real
+            # evolved states (MRKAN.collect_memory_references) are still the
+            # recommended reference distribution.
+            refs = reference_inputs.get(src)
+            if refs is None:
+                refs = torch.rand(
+                    n_samples,
+                    bank.layer_size,
+                    device=bank.layer_link_ratios.device,
+                )
 
             for tgt_key, per_item in bank.memory_kans.items():
                 tgt = int(tgt_key)

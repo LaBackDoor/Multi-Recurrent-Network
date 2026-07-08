@@ -133,6 +133,23 @@ def prepare_data(
     return train_dataset, val_dataset, test_dataset, scaler
 
 
+def init_baseline_weights(model: MRN) -> None:
+    """Xavier/zeros re-init for the plain feedforward paths only.
+
+    Scope matters: memory-projection weights keep the model's thesis-canonical
+    uniform(-weight_init_range, weight_init_range) init, and the first hidden
+    bias keeps hidden_bias_init_value (0.5). A broad "weight"/"bias" substring
+    match would silently clobber both and break the documented v1 protocol.
+    """
+    for name, param in model.named_parameters():
+        if "memory_weights" in name:
+            continue
+        if "weights." in name and param.dim() >= 2:
+            nn.init.xavier_uniform_(param)
+        elif "biases." in name and not name.endswith("biases.1"):
+            nn.init.zeros_(param)
+
+
 def train_epoch(
     model: MRN,
     data_loader: DataLoader,
@@ -353,9 +370,9 @@ def main():
     )
     parser.add_argument(
         "--use_minmax",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
         default=True,
-        help="Use MinMaxScaler instead of StandardScaler",
+        help="Use MinMaxScaler (pass --no-use_minmax for StandardScaler)",
     )
 
     parser.add_argument(
@@ -435,20 +452,7 @@ def main():
         nn_structure=nn_structure, memory_structure=args.memory_structure, device=device
     ).to(device)
 
-    def init_weights(m):
-        if isinstance(m, nn.Linear) or isinstance(m, nn.Parameter):
-            if hasattr(m, "weight"):
-                nn.init.xavier_uniform_(m.weight)
-            if hasattr(m, "bias") and m.bias is not None:
-                nn.init.zeros_(m.bias)
-
-    for name, param in model.named_parameters():
-        if "weight" in name:
-            nn.init.xavier_uniform_(param)
-        elif "bias" in name:
-            nn.init.zeros_(param)
-
-    init_weights(model)
+    init_baseline_weights(model)
 
     print(f"Network structure: {nn_structure}")
     print(f"Memory structure: {model.cell.memory_structure}")

@@ -1,6 +1,6 @@
 """Multi-Recurrent Neural Network (MRN) - sequence wrapper around MRNCell."""
 
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -70,7 +70,7 @@ class MRN(nn.Module):
         return_sequences: bool = True,
         return_state: bool = False,
         return_activations: bool = False,
-    ) -> Tuple[torch.Tensor, ...]:
+    ) -> Union[torch.Tensor, Tuple]:
         """
         Process a sequence.
 

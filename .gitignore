@@ -212,3 +212,6 @@ docs/
 
 # Git worktrees
 .worktrees/
+*.DS_Store*
+*.png
+*.pth

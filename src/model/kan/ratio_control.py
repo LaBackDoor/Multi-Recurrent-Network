@@ -5,7 +5,15 @@ The RCU is the v2 mechanism by which a memory bank's per-item layer-link
 ratios are *learned* rather than fixed at (i + 1) / K. It maps the current
 external input concatenated with this bank's flattened memory state to K
 ratios in (0, 1). Self-link factors are derived as 1 - layer-link, matching
-the thesis convention (Orojo 2022, Ch. 6).
+the thesis convention (Orojo 2022, Sec. 3.1.1.1).
+
+Deliberate departures from thesis SL-MRN 2 (Orojo 2022, Sec. 6.3.2):
+- each bank gets its own RCU fed by (input, this bank's memory), instead of
+  one ratio layer fed by the input plus ALL memory types (thesis Eq. 6.2);
+- the RCU does not contribute to the output layer (thesis Eq. 6.4 adds a
+  W_ro RCU->output term);
+- ratios are recomputed from live inputs at test time, whereas the thesis
+  freezes them after training (footnote, Sec. 6.3.2).
 
 Two backends:
 

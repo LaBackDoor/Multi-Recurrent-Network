@@ -12,14 +12,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - uses: astral-sh/setup-uv@v5
         with:
-          python-version: "3.11"
+          version: "latest"
+
+      - name: Set up Python
+        run: uv python install 3.11
 
       - name: Install dependencies
         run: |
-          pip install torch --index-url https://download.pytorch.org/whl/cpu
-          pip install pytest numpy scikit-learn pandas matplotlib seaborn
+          uv pip install --system torch --index-url https://download.pytorch.org/whl/cpu
+          uv pip install --system pytest numpy scikit-learn pandas matplotlib seaborn
+          uv pip install --system -e . --no-deps
 
       - name: Run tests
         run: pytest test/ -v --tb=short

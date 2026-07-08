@@ -34,8 +34,9 @@ from typing import Dict, List, Optional, Tuple, NamedTuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
-from src.model.kan.kan_linear import KANLinear
+from src.model.kan.kan_linear import KANLinear, batched_b_splines
 from src.model.kan.ratio_control import RatioControlUnit
 
 
@@ -77,6 +78,15 @@ class KANMemoryBank(nn.Module):
 
     Memory tensors live in MRKANState, not in this module, so memory is
     batch-aware and autograd can thread gradients through it.
+
+    Forward paths: ``use_fused_context`` (default True) evaluates all K items
+    per timestep with batched ops (stacked weights, one LayerNorm kernel, one
+    batched B-spline recursion, two bmms) instead of K sequential KANLinear
+    calls. The per-item modules stay the single source of truth for
+    parameters - the fused path stacks them on the fly - so state_dicts,
+    pruning, shrink and per-item inspection are unaffected; outputs match the
+    loop path up to fp32 kernel-order differences (~1e-6). Set
+    ``use_fused_context = False`` to fall back to the per-item loop.
     """
 
     def __init__(
@@ -118,6 +128,7 @@ class KANMemoryBank(nn.Module):
         self.init_memory_mode = init_memory_mode
         self.init_memory_value = init_memory_value
         self.learn_ratios = learn_ratios
+        self.use_fused_context = True
         self.device = device or torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
         )
@@ -222,10 +233,59 @@ class KANMemoryBank(nn.Module):
         if self.num_items == 0:
             return torch.zeros(batch_size, target_size, device=memory.device)
 
-        parts = []
-        for i in range(self.num_items):
-            parts.append(per_item[i](memory[:, i, :]))
-        return torch.stack(parts, dim=0).sum(dim=0)
+        # Single-item banks keep the plain module call (bit-exact, no stacking
+        # overhead); multi-item banks default to the fused batched path.
+        if self.num_items == 1 or not self.use_fused_context:
+            parts = []
+            for i in range(self.num_items):
+                parts.append(per_item[i](memory[:, i, :]))
+            return torch.stack(parts, dim=0).sum(dim=0)
+
+        return self._fused_context(memory, per_item)
+
+    def _fused_context(
+        self, memory: torch.Tensor, per_item: nn.ModuleList
+    ) -> torch.Tensor:
+        """Evaluate all K item KANLinears with batched ops.
+
+        Mathematically identical to summing per_item[i](memory[:, i, :]) over
+        i; parameters are stacked on the fly so gradients flow into the same
+        per-item tensors. All items in a bank share (in, out, grid, order, LN)
+        config by construction, which is what makes the stacking valid.
+
+        Args:
+            memory: [B, K, layer_size]
+
+        Returns:
+            context: [B, target_size]
+        """
+        first = per_item[0]
+        x = memory.transpose(0, 1)  # [K, B, L]
+
+        if first.layer_norm is not None:
+            # One affine-free LayerNorm kernel for all items, then each
+            # item's own affine params (LN weights differ per item).
+            normalized = F.layer_norm(
+                x, (self.layer_size,), eps=first.layer_norm.eps
+            )
+            ln_w = torch.stack([m.layer_norm.weight for m in per_item]).unsqueeze(1)
+            ln_b = torch.stack([m.layer_norm.bias for m in per_item]).unsqueeze(1)
+            x = normalized * ln_w + ln_b
+
+        base_w = torch.stack([m.base_weight for m in per_item])            # [K, out, in]
+        spline_w = torch.stack([m.scaled_spline_weight for m in per_item]) # [K, out, in, coeff]
+        grids = torch.stack([m.grid for m in per_item])                    # [K, in, knots]
+
+        base = torch.bmm(first.base_activation(x), base_w.transpose(1, 2))
+
+        bases = batched_b_splines(x, grids, first.spline_order)  # [K, B, in, coeff]
+        K, B = x.shape[0], x.shape[1]
+        spline = torch.bmm(
+            bases.reshape(K, B, -1),
+            spline_w.reshape(K, first.out_features, -1).transpose(1, 2),
+        )
+
+        return (base + spline).sum(dim=0)  # [B, out]
 
     def update_memory(
         self,
@@ -513,6 +573,16 @@ class MRKANCell(nn.Module):
                 for layer_idx, bank in self.memory_banks.items()
             }
         )
+
+    def set_fused_context(self, enabled: bool) -> None:
+        """Toggle the fused memory-context path on every bank.
+
+        Fused (default) evaluates all items of a bank with batched ops; the
+        loop fallback calls each item's KANLinear sequentially. Both compute
+        the same function - the fallback exists for debugging and A/B checks.
+        """
+        for bank in self.memory_banks.values():
+            bank.use_fused_context = enabled
 
     def _layer_pre_activation(
         self, layer_idx: int, prev_activation: torch.Tensor

@@ -30,6 +30,41 @@ import torch
 import torch.nn.functional as F
 
 
+def batched_b_splines(
+    x: torch.Tensor, grid: torch.Tensor, spline_order: int
+) -> torch.Tensor:
+    """Cox-de Boor recursion over a stack of K independent knot grids.
+
+    Same arithmetic as ``KANLinear.b_splines`` with one extra leading item
+    dimension, so K same-shaped KANLinears can be evaluated in a single set
+    of batched ops instead of K module calls.
+
+    Args:
+        x:    [K, N, in_features]
+        grid: [K, in_features, grid_size + 2*spline_order + 1]
+
+    Returns:
+        bases: [K, N, in_features, grid_size + spline_order]
+    """
+    assert x.dim() == 3 and grid.dim() == 3 and x.size(0) == grid.size(0)
+    assert x.size(2) == grid.size(1)
+
+    x = x.unsqueeze(-1)          # [K, N, in, 1]
+    grid = grid.unsqueeze(1)     # [K, 1, in, n_knots]
+    bases = ((x >= grid[..., :-1]) & (x < grid[..., 1:])).to(x.dtype)
+    for k in range(1, spline_order + 1):
+        bases = (
+            (x - grid[..., : -(k + 1)])
+            / (grid[..., k:-1] - grid[..., : -(k + 1)])
+            * bases[..., :-1]
+        ) + (
+            (grid[..., k + 1 :] - x)
+            / (grid[..., k + 1 :] - grid[..., 1:(-k)])
+            * bases[..., 1:]
+        )
+    return bases.contiguous()
+
+
 class KANLinear(torch.nn.Module):
     def __init__(
         self,

@@ -155,6 +155,11 @@ class MRKAN(nn.Module):
     def set_update_memory(self, update: bool):
         self.cell._update_memory_flag = update
 
+    def set_fused_context(self, enabled: bool) -> None:
+        """Toggle the fused (batched) memory-context path on every bank.
+        See MRKANCell.set_fused_context."""
+        self.cell.set_fused_context(enabled)
+
     def update_grids(self, calibration_inputs):
         """Forward to the cell. See MRKANCell.update_grids for the contract.
 
@@ -423,10 +428,18 @@ class MRKAN(nn.Module):
         """
         was_training = self.training
         prev_update_memory = self.cell._update_memory_flag
+        # Input collection works through forward hooks on each KANLinear, and
+        # the fused context path never invokes the per-item modules - force
+        # the loop path for the calibration forwards so the hooks fire.
+        prev_fused = {
+            key: bank.use_fused_context
+            for key, bank in self.cell.memory_banks.items()
+        }
         device = device or next(self.parameters()).device
 
         self.eval()
         self.set_update_memory(True)
+        self.cell.set_fused_context(False)
 
         try:
             collected: dict[int, list[torch.Tensor]] = {}
@@ -470,5 +483,7 @@ class MRKAN(nn.Module):
                 module.update_grid(x)
         finally:
             self.set_update_memory(prev_update_memory)
+            for key, bank in self.cell.memory_banks.items():
+                bank.use_fused_context = prev_fused[key]
             if was_training:
                 self.train()

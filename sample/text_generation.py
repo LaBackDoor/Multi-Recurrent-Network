@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 
+from src.model.device import default_device
 from src.model.mrn import MRN
 
 
@@ -394,7 +395,7 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Set device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = default_device()
     print(f"Using device: {device}")
 
     # Load data

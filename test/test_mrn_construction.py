@@ -52,7 +52,7 @@ print("\n" + "=" * 70)
 print("Single Timestep Test (using model 2)")
 print("=" * 70)
 
-single_input = torch.randn(model_2.input_size)
+single_input = torch.randn(model_2.input_size, device=model_2.device)
 output, activations, state = model_2.cell(single_input)
 
 print(f"Input shape: {single_input.shape}")
@@ -76,7 +76,9 @@ print("=" * 70)
 
 seq_len = 15
 batch_size = 3
-sequence_input = torch.randn(batch_size, seq_len, model_2.input_size)
+sequence_input = torch.randn(
+    batch_size, seq_len, model_2.input_size, device=model_2.device
+)
 
 # Get outputs only
 outputs = model_2(sequence_input)

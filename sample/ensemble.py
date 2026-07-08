@@ -19,6 +19,7 @@ from sklearn.preprocessing import MinMaxScaler, StandardScaler
 from torch.utils.data import DataLoader
 
 from sample.timeseries import TimeSeriesDataset
+from src.model.device import default_device
 from src.model.mrn import MRN
 
 
@@ -499,7 +500,7 @@ def main():
     args = parser.parse_args()
 
     # Setup
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = default_device()
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 

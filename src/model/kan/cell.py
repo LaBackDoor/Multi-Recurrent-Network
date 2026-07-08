@@ -36,6 +36,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from src.model.device import default_device
 from src.model.kan.kan_linear import KANLinear, batched_b_splines
 from src.model.kan.ratio_control import RatioControlUnit
 
@@ -129,9 +130,7 @@ class KANMemoryBank(nn.Module):
         self.init_memory_value = init_memory_value
         self.learn_ratios = learn_ratios
         self.use_fused_context = True
-        self.device = device or torch.device(
-            "cuda" if torch.cuda.is_available() else "cpu"
-        )
+        self.device = device or default_device()
 
         # Memory -> target-layer projections. One KANLinear per (target, item)
         # so a future spline-shape pruning pass can compare items 1:1.
@@ -449,9 +448,7 @@ class MRKANCell(nn.Module):
         self.hidden_bias_init_value = hidden_bias_init_value
         self.init_memory_mode = init_memory_mode
         self.init_memory_value = init_memory_value
-        self.device = device or torch.device(
-            "cuda" if torch.cuda.is_available() else "cpu"
-        )
+        self.device = device or default_device()
         self.memory_structure = list(memory_structure) + [0] * (
             self.num_layers - len(memory_structure)
         )

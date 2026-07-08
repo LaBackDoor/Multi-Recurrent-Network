@@ -33,6 +33,8 @@ from typing import Dict, List, Optional, Tuple, NamedTuple
 import torch
 import torch.nn as nn
 
+from src.model.device import default_device
+
 
 class MRNState(NamedTuple):
     """
@@ -86,9 +88,7 @@ class MemoryBank(nn.Module):
         self.target_layer_sizes = dict(target_layer_sizes)
         self.init_memory_mode = init_memory_mode
         self.init_memory_value = init_memory_value
-        self.device = device or torch.device(
-            "cuda" if torch.cuda.is_available() else "cpu"
-        )
+        self.device = device or default_device()
 
         if init_memory_mode not in ("random", "constant"):
             raise ValueError(
@@ -238,9 +238,7 @@ class MRNCell(nn.Module):
         self.hidden_bias_init_value = hidden_bias_init_value
         self.init_memory_mode = init_memory_mode
         self.init_memory_value = init_memory_value
-        self.device = device or torch.device(
-            "cuda" if torch.cuda.is_available() else "cpu"
-        )
+        self.device = device or default_device()
         self.memory_structure = list(memory_structure) + [0] * (
             self.num_layers - len(memory_structure)
         )

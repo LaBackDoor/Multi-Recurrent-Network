@@ -22,6 +22,7 @@ from sample.timeseries import (
     prepare_data,
     train_epoch,
 )
+from src.model.device import default_device
 from src.model.kan import MRKAN
 
 
@@ -104,7 +105,7 @@ def main():
 
     args = parser.parse_args()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = default_device()
     print(f"Using device: {device}")
 
     print("=" * 70)

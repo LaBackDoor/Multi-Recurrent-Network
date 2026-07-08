@@ -15,6 +15,7 @@ import torch.nn as nn
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from torch.utils.data import Dataset, DataLoader
 
+from src.model.device import default_device
 from src.model.mrn import MRN
 
 
@@ -416,7 +417,7 @@ def main():
 
     args = parser.parse_args()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = default_device()
     print(f"Using device: {device}")
 
     print("=" * 70)

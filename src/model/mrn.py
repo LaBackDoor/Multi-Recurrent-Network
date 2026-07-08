@@ -6,6 +6,7 @@ import torch
 from torch import nn
 
 from src.model.cell import MRNCell, MRNState
+from src.model.device import default_device
 
 
 class MRN(nn.Module):
@@ -41,9 +42,7 @@ class MRN(nn.Module):
 
         self.nn_structure = nn_structure
         self.memory_structure = memory_structure
-        self.device = device or torch.device(
-            "cuda" if torch.cuda.is_available() else "cpu"
-        )
+        self.device = device or default_device()
 
         self.input_size = nn_structure[0]
         self.output_size = nn_structure[-1]

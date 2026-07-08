@@ -199,7 +199,12 @@ class KANLinear(torch.nn.Module):
 
         A = self.b_splines(x).transpose(0, 1)  # (in, B, coeff)
         B = y.transpose(0, 1)                  # (in, B, out)
-        solution = torch.linalg.lstsq(A, B).solution  # (in, coeff, out)
+        if A.device.type == "mps":
+            # linalg_lstsq has no MPS kernel (torch 2.9); solve on CPU and
+            # move back so update_grid works on MPS-resident models.
+            solution = torch.linalg.lstsq(A.cpu(), B.cpu()).solution.to(A.device)
+        else:
+            solution = torch.linalg.lstsq(A, B).solution  # (in, coeff, out)
         result = solution.permute(2, 0, 1)     # (out, in, coeff)
         assert result.size() == (
             self.out_features,

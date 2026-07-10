@@ -16,6 +16,7 @@ import torch.nn as nn
 
 from src.model.kan import MRKAN, KANMemoryBank
 from src.model.kan.cell import sequence_kan_cache
+from src.model.kan.mrkan import detached_sample
 from src.model.kan.kan_linear import KANLinear, batched_b_splines
 
 
@@ -342,6 +343,192 @@ def test_fused_rejects_heterogeneous_items_instead_of_diverging_silently():
     bank.memory_kans["1"][0].layer_norm = None
     with pytest.raises(RuntimeError, match="homogeneous items"):
         bank.compute_context(memory, target_layer=1)
+
+
+@pytest.mark.parametrize(
+    "nn_structure,memory_structure",
+    [([3, 8, 1], [2, 2, 2]), ([1, 16, 32, 1], [4, 3, 2, 4]), ([4, 6, 5, 2], [3, 0, 2, 1])],
+)
+def test_precomputed_input_context_matches_the_loop(nn_structure, memory_structure):
+    """Hoisting the layer-0 bank's KAN evaluation out of the timestep loop must
+    not change outputs, final memory, or gradients."""
+    torch.manual_seed(0)
+    model = MRKAN(nn_structure, memory_structure, device=torch.device("cpu"))
+    x = torch.rand(3, 7, nn_structure[0])
+    state = model.init_state(3)
+
+    def run(precompute):
+        model.set_precompute_input_context(precompute)
+        model.zero_grad(set_to_none=True)
+        out, final = model(x, states=state.clone(), return_state=True)
+        out.square().mean().backward()
+        grads = {n: p.grad.clone() for n, p in model.named_parameters()}
+        mem = {k: v.detach().clone() for k, v in final.memory_banks.items()}
+        return out.detach().clone(), grads, mem
+
+    out_loop, g_loop, m_loop = run(False)
+    out_pre, g_pre, m_pre = run(True)
+
+    torch.testing.assert_close(out_pre, out_loop, rtol=1e-5, atol=1e-6)
+    for key in m_loop:
+        torch.testing.assert_close(m_pre[key], m_loop[key], rtol=1e-5, atol=1e-6)
+    assert g_loop, "no parameter received a gradient"
+    for name in g_loop:
+        torch.testing.assert_close(
+            g_pre[name], g_loop[name], rtol=1e-4, atol=1e-6,
+            msg=lambda m, n=name: f"gradient mismatch on {n}\n{m}",
+        )
+
+
+def test_precompute_disabled_when_ratios_are_learned():
+    """An RCU makes the layer-0 ratio depend on memory through a KAN. The
+    trajectory is still input-only, but producing it costs T sequential KAN
+    calls, which the batched context would not pay for. Excluded."""
+    torch.manual_seed(0)
+    rcu_model = MRKAN([4, 10, 1], [3, 0, 0], learn_ratios=True, device=torch.device("cpu"))
+    assert rcu_model.cell.memory_banks["0"].rcu is not None
+    assert not rcu_model.cell.can_precompute_input_context()
+
+    plain = MRKAN([4, 10, 1], [3, 0, 0], device=torch.device("cpu"))
+    assert plain.cell.can_precompute_input_context()
+
+    # SL-MR-KAN must still run and backprop with the flag left at its default.
+    out = rcu_model(torch.rand(2, 5, 4))
+    out.sum().backward()
+    for n, p in rcu_model.named_parameters():
+        assert p.grad is not None and torch.isfinite(p.grad).all(), f"bad grad on {n}"
+
+
+def test_precompute_uses_the_incoming_memory_not_the_updated_one():
+    """Off-by-one guard: the precomputed trajectory must start at M_0 and
+    exclude M_T. A shift-by-one has the same shape and would train silently."""
+    torch.manual_seed(0)
+    model = MRKAN([3, 8, 1], [2, 0, 0], device=torch.device("cpu"))
+    cell = model.cell
+    bank = cell.memory_banks["0"]
+    x = torch.rand(4, 5, 3)
+    m0 = model.init_state(4).memory_banks[0]
+    target = cell._chain_target(0)
+
+    context = cell.precompute_input_context(x, m0)
+    torch.testing.assert_close(
+        context[0], bank.compute_context(m0, target_layer=target), rtol=1e-5, atol=1e-6
+    )
+    m1 = bank.update_memory(x[:, 0], m0)
+    torch.testing.assert_close(
+        context[1], bank.compute_context(m1, target_layer=target), rtol=1e-5, atol=1e-6
+    )
+    assert not torch.allclose(context[0], context[1])
+
+
+def test_precompute_falls_back_when_state_omits_the_input_bank():
+    """A state without the layer-0 bank is legal; the precompute must not
+    KeyError on it."""
+    torch.manual_seed(0)
+    model = MRKAN([3, 8, 1], [2, 2, 0], device=torch.device("cpu"))
+    model.set_update_memory(False)
+    x = torch.rand(2, 4, 3)
+    full = model.init_state(2)
+    partial = type(full)(memory_banks={1: full.memory_banks[1]})
+
+    model.set_precompute_input_context(False)
+    loop = model(x, states=partial)
+    model.set_precompute_input_context(True)
+    pre = model(x, states=partial)
+    torch.testing.assert_close(pre, loop, rtol=1e-5, atol=1e-6)
+
+
+def test_precompute_rejects_a_batch_mismatched_state():
+    torch.manual_seed(0)
+    model = MRKAN([3, 8, 1], [2, 0, 0], device=torch.device("cpu"))
+    x = torch.rand(5, 4, 3)
+    with pytest.raises(ValueError, match="batch"):
+        model.cell.precompute_input_context(x, model.init_state(1).memory_banks[0])
+
+
+def test_precompute_matches_loop_under_chunked_streaming():
+    torch.manual_seed(0)
+    model = MRKAN([3, 8, 1], [2, 2, 2], device=torch.device("cpu"))
+    x = torch.rand(2, 9, 3)
+    state = model.init_state(2)
+
+    def whole(precompute):
+        model.set_precompute_input_context(precompute)
+        return model(x, states=state.clone())
+
+    def chunked(precompute):
+        model.set_precompute_input_context(precompute)
+        s = state.clone()
+        outs = []
+        for chunk in x.split(3, dim=1):
+            out, s = model(chunk, states=s, return_state=True)
+            outs.append(out)
+        return torch.cat(outs, dim=1)
+
+    reference = whole(False)
+    torch.testing.assert_close(whole(True), reference, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(chunked(False), reference, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(chunked(True), reference, rtol=1e-5, atol=1e-6)
+
+
+def test_precompute_survives_prune_and_calibrate():
+    """Pruning rebuilds the layer-0 bank; calibration forces the loop path and
+    relies on per-item forward hooks. Both must still work with the hoist on."""
+    torch.manual_seed(0)
+    model = MRKAN([3, 8, 1], [4, 0, 0], device=torch.device("cpu"))
+    x = torch.rand(2, 5, 3)
+
+    pruned, _ = model.prune(threshold=0.0)  # drop nothing
+    assert pruned.cell.can_precompute_input_context()
+    pruned(x).sum().backward()
+
+    model.calibrate_grids([torch.rand(2, 5, 3)], n_batches=1)
+    assert model.cell.can_precompute_input_context(), "flag not restored"
+    model(x).sum().backward()
+
+
+def test_detached_sample_copies_rather_than_views():
+    """calibrate_grids' hook and collect_memory_references both retain the
+    activations they see. Under torch.compile(mode="reduce-overhead") those live
+    in CUDA-graph static buffers that the next replay overwrites, so retaining a
+    detached *view* means update_grid reads clobbered data. The copy is
+    load-bearing; on CPU the aliasing is observable via storage."""
+    source = torch.rand(2, 4, 3)
+    sample = detached_sample(source)
+
+    assert sample.shape == (8, 3), "must flatten leading dims to [N, features]"
+    assert not sample.requires_grad
+    assert (
+        sample.untyped_storage().data_ptr() != source.untyped_storage().data_ptr()
+    ), "detached_sample returned a view; a graph replay would overwrite it"
+
+    with torch.no_grad():
+        source.zero_()
+    assert sample.abs().sum() > 0, "sample tracked a mutation of its source"
+
+
+def test_calibrate_grids_bypasses_a_replaced_forward():
+    """`model.forward = torch.compile(model.forward)` installs an instance
+    attribute. calibrate_grids must not run through it: under CUDA-graph capture
+    the activations its hooks retain get overwritten, and update_grid's in-place
+    writes would not be observed. Simulated here with a sentinel forward."""
+    torch.manual_seed(0)
+    model = MRKAN([3, 8, 1], [2, 0, 0], device=torch.device("cpu"))
+    calls = []
+
+    real_forward = model.forward
+
+    def spy_forward(*args, **kwargs):
+        calls.append(1)
+        return real_forward(*args, **kwargs)
+
+    model.forward = spy_forward  # what torch.compile does
+    grid_before = model.cell.memory_banks["0"].memory_kans["1"][0].grid.clone()
+    model.calibrate_grids([torch.rand(2, 5, 3)], n_batches=1)
+    grid_after = model.cell.memory_banks["0"].memory_kans["1"][0].grid
+
+    assert not calls, "calibrate_grids went through the replaced forward"
+    assert not torch.allclose(grid_before, grid_after), "grids were not calibrated"
 
 
 def test_calibrate_grids_removes_hooks_when_a_batch_raises():

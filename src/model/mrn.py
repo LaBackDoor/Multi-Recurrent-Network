@@ -103,8 +103,22 @@ class MRN(nn.Module):
         # The per-item weight concat is loop-invariant; build it once for the
         # whole sequence rather than once per timestep.
         with sequence_weight_cache(self.cell.memory_banks.values()):
+            # The layer-0 bank's memory is driven by the inputs alone, so its
+            # context for every timestep can be evaluated in one batched call
+            # before the loop instead of T calls inside it.
+            input_context = None
+            if self.cell.can_precompute_input_context():
+                # A state that omits the layer-0 bank is legal (the cell's own
+                # guards skip that bank), so fall back to the in-loop path.
+                memory_0 = {int(k): v for k, v in states.memory_banks.items()}.get(0)
+                if memory_0 is not None:
+                    input_context = self.cell.precompute_input_context(inputs, memory_0)
+
             for t in range(sequence_length):
-                cell_output, cell_activations, states = self.cell(inputs[:, t], states)
+                precomputed = None if input_context is None else {0: input_context[t]}
+                cell_output, cell_activations, states = self.cell(
+                    inputs[:, t], states, precomputed_context=precomputed
+                )
                 outputs_values.append(cell_output)
                 for layer_index, activation in cell_activations.items():
                     layer_activations_list[layer_index].append(activation)
@@ -146,3 +160,9 @@ class MRN(nn.Module):
 
         See MRNCell.set_fused_context."""
         self.cell.set_fused_context(enabled)
+
+    def set_precompute_input_context(self, enabled: bool) -> None:
+        """Toggle hoisting the layer-0 bank's context out of the timestep loop.
+
+        See MRNCell.can_precompute_input_context."""
+        self.cell.set_precompute_input_context(enabled)

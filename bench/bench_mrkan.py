@@ -87,8 +87,10 @@ MODEL_COMPILE_MAX_T = 32
 VARIANTS = [
     ("loop ", "eager", True),
     ("fused", "eager", False),  # isolates the per-sequence stack hoist
+    ("nopre", "eager", True),   # fused+hoist, layer-0 context NOT precomputed
     ("fused", "eager", True),
     ("loop ", "cell", True),
+    ("nopre", "cell", True),
     ("fused", "cell", True),
     ("fused", "cell-cudagraph", True),  # expected to fail; kept as documentation
     ("loop ", "model", True),
@@ -199,7 +201,13 @@ def run_one(args) -> None:
 
     x = torch.randn(batch, seq_len, nn_structure[0], device=device)
     model = build(cfg, device, args.arch)
-    model.set_fused_context(args.path == "fused")
+    # "loop"  = the true pre-optimization baseline: per-item context loop, no
+    #           layer-0 hoist. Leaving precompute on here would fold part of the
+    #           new speedup into the baseline and understate everything.
+    # "nopre" = batched context, layer-0 still evaluated inside the loop.
+    # "fused" = batched context + layer-0 precompute (the shipped default).
+    model.set_fused_context(args.path in ("fused", "nopre"))
+    model.set_precompute_input_context(args.path == "fused")
 
     if args.compile_mode == "cell":
         model.cell.forward = torch.compile(model.cell.forward, dynamic=False)
@@ -321,7 +329,7 @@ def main() -> None:
     # worker-only
     p.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--config", default=CONFIGS[0][0])
-    p.add_argument("--path", default="loop", choices=["loop", "fused"])
+    p.add_argument("--path", default="loop", choices=["loop", "fused", "nopre"])
     p.add_argument("--compile-mode", dest="compile_mode", default="eager")
     p.add_argument("--backward", action="store_true")
     p.add_argument("--hoist", action="store_true")

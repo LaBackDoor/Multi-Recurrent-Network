@@ -38,6 +38,28 @@ import torch.nn.functional as F
 from src.model.device import default_device
 
 
+# Rows (T*B) evaluated per batched context call. Under autograd the whole
+# sequence's intermediates are retained either way, so slabbing changes nothing;
+# under no_grad it caps the peak, which otherwise grows linearly in T where the
+# per-timestep path was O(1). Sized so a normal training config (T*B in the low
+# thousands) takes a single slab and pays nothing.
+MAX_CONTEXT_ROWS = 16384
+
+
+def context_in_slabs(
+    bank: nn.Module, flat_memory: torch.Tensor, target_layer: int
+) -> torch.Tensor:
+    """bank.compute_context over [N, K, L], chunked to bound peak memory."""
+    rows = flat_memory.shape[0]
+    if rows <= MAX_CONTEXT_ROWS:
+        return bank.compute_context(flat_memory, target_layer=target_layer)
+    parts = [
+        bank.compute_context(flat_memory[i : i + MAX_CONTEXT_ROWS], target_layer=target_layer)
+        for i in range(0, rows, MAX_CONTEXT_ROWS)
+    ]
+    return torch.cat(parts, dim=0)
+
+
 @contextmanager
 def sequence_weight_cache(banks: Iterator[nn.Module]) -> Iterator[None]:
     """Hold concatenated memory weights for the duration of one sequence.
@@ -317,6 +339,14 @@ class MRNCell(nn.Module):
             self.num_layers - len(memory_structure)
         )
         self._update_memory_flag = True
+        # Off by default for MRN, unlike MR-KAN. The hoist trades T small
+        # per-timestep context evaluations for one big one, which pays only when
+        # each evaluation is expensive. MRN's context is already a single GEMM,
+        # so hoisting it buys nothing and costs an extra EMA loop plus a stack:
+        # measured neutral-to-2-5%-slower at both the covid and ett configs,
+        # against 1.2-1.45x for MR-KAN, whose per-timestep context is ~20 kernels
+        # of B-spline work. Enable with set_precompute_input_context(True).
+        self.use_precomputed_input_context = False
 
         self.input_size = nn_structure[0]
         self.output_size = nn_structure[-1]
@@ -408,8 +438,74 @@ class MRNCell(nn.Module):
         for bank in self.memory_banks.values():
             bank.use_fused_context = enabled
 
+    def set_precompute_input_context(self, enabled: bool) -> None:
+        """Toggle hoisting the layer-0 bank's context out of the timestep loop."""
+        self.use_precomputed_input_context = enabled
+
+    def can_precompute_input_context(self) -> bool:
+        """Whether the layer-0 bank's context is computable before the loop.
+
+        The bank sourced from layer 0 stores ``activations[0]``, i.e. the raw
+        input, and its ratios are fixed, so its update is a parameter-free EMA
+        of the inputs alone:
+
+            M_{t+1} = r * inputs_t + (1 - r) * M_t
+
+        The whole trajectory -- and hence every timestep's context -- is a
+        function of (M_0, inputs) and needs nothing from the recurrence.
+        """
+        return self.use_precomputed_input_context and "0" in self.memory_banks
+
+    def precompute_input_context(
+        self, inputs: torch.Tensor, initial_memory: torch.Tensor
+    ) -> torch.Tensor:
+        """Contexts contributed by the layer-0 bank at every timestep.
+
+        One GEMM over all T*B rows instead of T GEMMs over B rows -- the same
+        restructuring cuDNN applies to an LSTM's input-side GEMM.
+
+        At step t the cell reads the incoming memory M_t and only afterwards
+        writes M_{t+1}, so the contexts needed are those of M_0..M_{T-1}: the
+        stack below deliberately excludes the final state.
+
+        Args:
+            inputs:         [B, T, input_size]
+            initial_memory: [B, K, input_size] -- the layer-0 bank's M_0
+
+        Returns:
+            context: [T, B, target_size]
+        """
+        bank = self.memory_banks["0"]
+        if len(bank.memory_weights) != 1:
+            raise RuntimeError(
+                "precompute_input_context assumes the layer-0 bank projects to "
+                f"exactly one target layer, got {len(bank.memory_weights)}."
+            )
+        target_layer = self._chain_target(0)
+        batch_size, seq_len, _ = inputs.shape
+
+        # update_memory broadcasts, so a [1, K, L] state against a batch-B input
+        # used to work. torch.stack below would not; keep the old semantics.
+        if initial_memory.shape[0] == 1 and batch_size != 1:
+            initial_memory = initial_memory.expand(batch_size, -1, -1)
+
+        memory = initial_memory
+        trajectory = []
+        for t in range(seq_len):
+            trajectory.append(memory)
+            if self._update_memory_flag:
+                memory = bank.update_memory(inputs[:, t], memory)
+
+        stacked = torch.stack(trajectory, dim=0)  # [T, B, K, L]
+        flat = stacked.reshape(seq_len * batch_size, bank.num_items, bank.layer_size)
+        context = context_in_slabs(bank, flat, target_layer)
+        return context.view(seq_len, batch_size, -1)
+
     def forward(
-        self, inputs: torch.Tensor, state: Optional[MRNState] = None
+        self,
+        inputs: torch.Tensor,
+        state: Optional[MRNState] = None,
+        precomputed_context: Optional[Dict[int, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, Dict[int, torch.Tensor], MRNState]:
         """
         Process one timestep.
@@ -419,6 +515,9 @@ class MRNCell(nn.Module):
             state: MRNState to read memory from. If None, a fresh state is
                 created. Pass an existing state (from a previous forward) to
                 chain timesteps together; autograd will backprop across them.
+            precomputed_context: {source_layer: [B, target_size]} contexts that
+                have already been evaluated for this timestep, used instead of
+                calling that bank's compute_context. See precompute_input_context.
 
         Returns:
             output: [B, output_size] (or [output_size] if input was unbatched)
@@ -457,6 +556,17 @@ class MRNCell(nn.Module):
                 for mem_layer_idx_str, bank in self.memory_banks.items():
                     mem_layer_idx = int(mem_layer_idx_str)
                     if mem_layer_idx in memory and str(layer_idx) in bank.memory_weights:
+                        # Keyed by SOURCE layer, so only inject at that bank's
+                        # own target. A hand-built multi-target bank would
+                        # otherwise get the same (wrongly shaped) context added
+                        # at every target it feeds.
+                        if (
+                            precomputed_context is not None
+                            and mem_layer_idx in precomputed_context
+                            and layer_idx == self._chain_target(mem_layer_idx)
+                        ):
+                            context_parts.append(precomputed_context[mem_layer_idx])
+                            continue
                         bank_context = bank.compute_context(
                             memory[mem_layer_idx], target_layer=layer_idx
                         )

@@ -14,6 +14,36 @@ from src.model.kan.cell import MRKANCell, MRKANState, sequence_kan_cache
 from src.model.kan.kan_linear import KANLinear
 
 
+def _mark_cudagraph_step() -> None:
+    """Tell CUDA-graph trees that a new inference step starts here.
+
+    Under ``torch.compile(mode="reduce-overhead")`` consecutive calls to the
+    compiled callable belong to the same "step", and tensors produced by call N
+    are invalidated by call N+1. The grid-calibration and reference-collection
+    helpers below deliberately retain data from every call, so each one has to
+    open its own step or the retained tensors raise on read.
+
+    A no-op when the model was never compiled.
+    """
+    marker = getattr(torch.compiler, "cudagraph_mark_step_begin", None)
+    if marker is not None:
+        marker()
+
+
+def detached_sample(x: torch.Tensor) -> torch.Tensor:
+    """A 2D [N, features] copy of an activation, safe to retain.
+
+    The copy is load-bearing, not defensive: under a captured CUDA graph
+    (``torch.compile(mode="reduce-overhead")``) activations live in static
+    buffers that the next replay overwrites, so a detached *view* would be
+    silently clobbered before anything read it. Retaining a view also pins the
+    whole activation's storage alive.
+    """
+    if x.dim() > 2:
+        x = x.reshape(-1, x.shape[-1])
+    return x.detach().clone()
+
+
 class MRKAN(nn.Module):
     """Multi-Recurrent KAN.
 
@@ -120,8 +150,24 @@ class MRKAN(nn.Module):
         # The per-item parameter stacks are loop-invariant; build them once for
         # the whole sequence rather than once per timestep.
         with sequence_kan_cache(self.cell.memory_banks.values()):
+            # The layer-0 bank's memory is driven by the inputs alone, so its
+            # context for every timestep can be evaluated in one batched call
+            # before the loop instead of T calls inside it.
+            input_context = None
+            if self.cell.can_precompute_input_context():
+                # Callers may hand back a state whose keys are strings; the cell
+                # normalises them, so do the same here. A state that omits the
+                # layer-0 bank is legal (the cell's own guards skip that bank),
+                # so fall back to the in-loop path rather than raising.
+                memory_0 = {int(k): v for k, v in states.memory_banks.items()}.get(0)
+                if memory_0 is not None:
+                    input_context = self.cell.precompute_input_context(inputs, memory_0)
+
             for t in range(sequence_length):
-                cell_output, cell_activations, states = self.cell(inputs[:, t], states)
+                precomputed = None if input_context is None else {0: input_context[t]}
+                cell_output, cell_activations, states = self.cell(
+                    inputs[:, t], states, precomputed_context=precomputed
+                )
                 outputs_values.append(cell_output)
                 for layer_index, activation in cell_activations.items():
                     layer_activations_list[layer_index].append(activation)
@@ -161,6 +207,11 @@ class MRKAN(nn.Module):
         """Toggle the fused (batched) memory-context path on every bank.
         See MRKANCell.set_fused_context."""
         self.cell.set_fused_context(enabled)
+
+    def set_precompute_input_context(self, enabled: bool) -> None:
+        """Toggle hoisting the layer-0 bank's context out of the timestep loop.
+        See MRKANCell.can_precompute_input_context."""
+        self.cell.set_precompute_input_context(enabled)
 
     def update_grids(self, calibration_inputs):
         """Forward to the cell. See MRKANCell.update_grids for the contract.
@@ -220,9 +271,14 @@ class MRKAN(nn.Module):
                 state = self.cell.init_state(batch_size=x.shape[0])
                 with sequence_kan_cache(self.cell.memory_banks.values()):
                     for t in range(x.shape[1]):
-                        _, _, state = self.cell(x[:, t], state)
+                        # Class function, not the instance attribute: a
+                        # torch.compile'd cell captured with CUDA graphs would
+                        # invalidate the memory tensors we retain below on the
+                        # next timestep's replay. See _mark_cudagraph_step.
+                        _mark_cudagraph_step()
+                        _, _, state = type(self.cell).forward(self.cell, x[:, t], state)
                         for src, mem in state.memory_banks.items():
-                            records[src].append(mem.reshape(-1, mem.shape[-1]))
+                            records[src].append(detached_sample(mem))
             refs: Dict[int, torch.Tensor] = {}
             for src, rows in records.items():
                 if not rows:
@@ -451,10 +507,9 @@ class MRKAN(nn.Module):
 
             def make_hook(kan_id: int):
                 def hook(module, inputs, output):
-                    x = inputs[0]
-                    if x.dim() > 2:
-                        x = x.reshape(-1, x.shape[-1])
-                    collected.setdefault(kan_id, []).append(x.detach())
+                    collected.setdefault(kan_id, []).append(
+                        detached_sample(inputs[0])
+                    )
 
                 return hook
 
@@ -473,7 +528,16 @@ class MRKAN(nn.Module):
                     else:
                         x = batch
                     x = x.to(device)
-                    self.forward(x)
+                    _mark_cudagraph_step()
+                    # type(self).forward, not self.forward: `model.forward =
+                    # torch.compile(model.forward)` installs an INSTANCE
+                    # attribute, and calibration must not run through a captured
+                    # CUDA graph. The hooks below retain the activations they
+                    # see, and graph replay overwrites them; update_grid also
+                    # writes grids and spline weights in place, which a captured
+                    # graph would not observe. Going through the class function
+                    # runs the plain eager forward regardless.
+                    type(self).forward(self, x)
             finally:
                 # Must run even if a batch raises. A leaked forward hook keeps
                 # appending activations into `collected` on every subsequent

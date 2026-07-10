@@ -209,6 +209,58 @@ def scenario_gradient_accumulation():
     return ok
 
 
+def _step_with_replay_between(model, batches, state, replay_batch, lr=1e-3):
+    """opt.step() reads p.grad, which lives in the backward graph's static output
+    buffer. Slip another replay in before the read and the buffer may already be
+    somebody else's."""
+    opt = torch.optim.AdamW(model.parameters(), lr=lr)
+    for x, y in batches:
+        opt.zero_grad(set_to_none=True)
+        out = model(x, states=state.clone(), return_sequences=False)
+        torch.nn.functional.mse_loss(out, y).backward()
+        if replay_batch is not None:  # the intruder: a forward between bwd and step
+            with torch.no_grad():
+                vx, _ = replay_batch
+                model(vx, states=state.clone(), return_sequences=False)
+        opt.step()
+    return {n: p.detach().clone() for n, p in model.named_parameters()}
+
+
+def scenario_replay_between_backward_and_step():
+    """The ordering the other scenarios never produce: bwd -> replay -> step.
+
+    Everywhere else the optimizer reads `p.grad` immediately after backward, so
+    the static buffer is still live. A metric/validation forward slipped in
+    between is a second replay, and `opt.step()` then reads grads that the new
+    replay may have clobbered. Does it raise, or read stale numbers silently?
+    """
+    batches = _data(4)
+    intruder = _data(1, seed=77)[0]
+
+    state = _build(False).init_state(B)  # shape only; each run rebuilds
+    ref = _step_with_replay_between(_build(False), batches, state, None)
+    scale = max(p.abs().max().item() for p in ref.values())
+
+    outcomes = {}
+    for label, intr in (("no replay between", None), ("replay between", intruder)):
+        try:
+            got = _step_with_replay_between(_build(True), batches, state, intr)
+        except RuntimeError as exc:
+            outcomes[label] = ("RAISES", str(exc)[:60])
+            continue
+        worst = max((ref[n] - got[n]).abs().max().item() for n in ref)
+        clean = worst < 1e-4 * max(scale, 1.0)
+        outcomes[label] = ("matches" if clean else "SILENTLY WRONG", f"{worst:.3e}")
+
+    for label, (verdict, detail) in outcomes.items():
+        print(f"  bwd -> [{label:18s}] -> step: {verdict}  ({detail})")
+
+    bad = outcomes["replay between"][0] == "SILENTLY WRONG"
+    if bad:
+        print("    -> a replay between backward and step corrupts grads SILENTLY")
+    return not bad
+
+
 def scenario_interleaved_validation():
     """Training steps interleaved with no_grad validation, as every real loop does.
     Forward-only under a captured graph is where the cell-level variant died."""
@@ -343,6 +395,7 @@ def main() -> None:
     scenarios = [
         ("loss parity", scenario_loss_parity),
         ("gradient accumulation", scenario_gradient_accumulation),
+        ("replay between bwd and step", scenario_replay_between_backward_and_step),
         ("retained outputs", scenario_retained_output_is_overwritten),
         ("interleaved validation", scenario_interleaved_validation),
         ("ragged last batch", scenario_ragged_last_batch),

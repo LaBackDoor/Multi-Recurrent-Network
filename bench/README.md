@@ -70,10 +70,11 @@ rather than a tight `step(); step()` loop. Verdict: **yes, with two rules.**
 | --- | --- |
 | 25 AdamW steps, loss + final params vs eager | identical (max loss diff 3e-8, param diff 1e-5) |
 | gradient accumulation (4 backwards, 1 step) | raises unless `p.grad` is cloned each backward; exact once it is |
+| a forward replay between `backward()` and `opt.step()` | raises |
 | train / `no_grad` validation interleaved | works |
 | ragged final batch (`drop_last=False`) | works; recompiles once (2 graphs) |
 | `calibrate_grids` between epochs | works |
-| per training step (fwd+bwd+AdamW) | ~10–18× faster than eager, peak 23 → 17 MiB |
+| per training step (fwd+bwd+AdamW) | 3.2–11.9 ms vs ~120–136 ms eager, peak 23 → 17 MiB |
 
 The two rules:
 
@@ -87,8 +88,11 @@ The two rules:
    accumulation hits the same wall: without `p.grad = p.grad.clone()` after each backward it
    raises at `opt.step()`; with it, the accumulated gradients match eager to 1.2e-7.
 
-Both failures are loud. We could not construct a case where graph capture silently produced
-wrong gradients in an ordinary loop.
+Both failures are loud, and the nastiest-looking ordering is loud too: a validation or metric
+forward slipped *between* `backward()` and `opt.step()` is a second replay, and the optimizer
+would then read grads the replay had clobbered. It raises instead. Across every pattern the
+probe drives, graph capture never silently produced wrong gradients — the only silent
+divergence we found is rule 1, and that is initial state, not gradients.
 
 `T` is pinned by the capture, and a batch-size change costs one recompile. Both are fine for a
 fixed-window trainer. Throughput above is a *lower bound*: the probe must disable inductor's

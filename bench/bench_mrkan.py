@@ -46,10 +46,15 @@ from typing import Callable, Dict, List, Optional
 if sys.platform == "win32":
     os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", "C:/ti")
     os.environ.setdefault("TRITON_CACHE_DIR", "C:/tc")
-    # Inductor's static CUDA launcher passes 64-bit device pointers through a
-    # C `long`, which is 32-bit on Windows (LLP64), so allocations above 2 GiB
-    # raise OverflowError. Address-dependent, hence intermittent.
-    os.environ.setdefault("TORCHINDUCTOR_USE_STATIC_CUDA_LAUNCHER", "0")
+
+# NOTE: inductor's static CUDA launcher is left ENABLED here even though it can
+# raise "OverflowError: Python int too large to convert to C long" on Windows
+# (it passes 64-bit device pointers through a 32-bit C `long`). Disabling it
+# costs ~1.25x on the launch-bound compiled variants, which would understate the
+# speedups this script exists to measure. `conftest.py` disables it for the test
+# suite instead, where determinism matters more than throughput. If a compiled
+# variant here dies with OverflowError, re-run: the failure is address-dependent
+# and each variant is its own subprocess.
 
 import torch
 
@@ -262,6 +267,8 @@ def run(args) -> None:
 
     for cfg in CONFIGS:
         name, nn_structure, memory_structure, batch, seq_len = cfg
+        if args.only and name != args.only:
+            continue
         print(f"\n=== {name}: nn={nn_structure} mem={memory_structure} B={batch} T={seq_len} ===")
 
         if args.explain:
@@ -302,10 +309,15 @@ def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--arch", default="mrkan", choices=sorted(ARCHS))
-    p.add_argument("--warmup", type=int, default=3)
-    p.add_argument("--iters", type=int, default=10)
+    # Small models (MRN at the covid config is ~5k params) are dominated by GPU
+    # clock/boost state. At warmup=3/iters=10 the same variant varied ~2x
+    # run-to-run and the fused path could look slower than the unfused one.
+    # These defaults bring it inside ~1%.
+    p.add_argument("--warmup", type=int, default=10)
+    p.add_argument("--iters", type=int, default=30)
     p.add_argument("--explain", action="store_true")
     p.add_argument("--force-model-compile", action="store_true")
+    p.add_argument("--only", help="run just this config (e.g. covid)")
     # worker-only
     p.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--config", default=CONFIGS[0][0])

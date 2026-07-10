@@ -13,6 +13,11 @@ dependencies = [
     "scikit-learn>=1.8.0",
     "seaborn>=0.13.2",
     "torch>=2.9.1",
+    # torch.compile needs Triton. On Linux, `torch` pulls it in itself; on
+    # Windows it ships as a separate wheel. Declaring it here (behind the
+    # marker) makes `uv sync` give both platforms the same capability. Keep the
+    # minor version aligned with torch: 2.9 <-> triton 3.5.
+    "triton-windows>=3.5,<3.6 ; sys_platform == 'win32'",
 ]
 
 [[tool.uv.index]]

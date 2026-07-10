@@ -29,11 +29,36 @@ BROADCAST DESIGN: All memory banks project to ALL hidden layers. For 3-layer
 networks this reduces to the single hidden layer, matching NumPy exactly.
 """
 
-from typing import Dict, List, Optional, Tuple, NamedTuple
+from contextlib import contextmanager
+from typing import Dict, Iterator, List, Optional, Tuple, NamedTuple
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from src.model.device import default_device
+
+
+@contextmanager
+def sequence_weight_cache(banks: Iterator[nn.Module]) -> Iterator[None]:
+    """Hold concatenated memory weights for the duration of one sequence.
+
+    The concatenation in ``MemoryBank._concat_weight`` is loop-invariant: the
+    parameters do not change across the timesteps of a single forward. Without
+    a cache, an unrolled T-step forward rebuilds it T times, and backward then
+    threads T separate cat nodes. Building it once per forward keeps a single
+    cat node in the graph, so gradients accumulate into the same per-item
+    parameters exactly as before.
+
+    Cleared on exit so no autograd graph outlives the forward that built it.
+    """
+    entered = list(banks)
+    for bank in entered:
+        bank._weight_cache = {}
+    try:
+        yield
+    finally:
+        for bank in entered:
+            bank._weight_cache = None
 
 
 class MRNState(NamedTuple):
@@ -89,6 +114,9 @@ class MemoryBank(nn.Module):
         self.init_memory_mode = init_memory_mode
         self.init_memory_value = init_memory_value
         self.device = device or default_device()
+        self.use_fused_context = True
+        # Populated only inside sequence_weight_cache(); None means "rebuild".
+        self._weight_cache: Optional[Dict[int, torch.Tensor]] = None
 
         if init_memory_mode not in ("random", "constant"):
             raise ValueError(
@@ -111,6 +139,45 @@ class MemoryBank(nn.Module):
                 ]
             )
             self.memory_weights[str(target_layer_idx)] = weights_for_layer
+
+        # Sluggish-update ratios r_i = (i+1)/K, precomputed as [1, K, 1] so the
+        # update is one broadcast instead of a K-step Python loop. Both r and
+        # (1 - r) are materialised from the same float64 Python arithmetic the
+        # loop used, so the fused update is bit-exact rather than 1-ulp off.
+        # Non-persistent: they are derived from num_items, so keeping them out
+        # of state_dict preserves checkpoint compatibility.
+        ratios = [(i + 1) / num_items for i in range(num_items)] if num_items else []
+        self.register_buffer(
+            "_ratios",
+            torch.tensor(ratios, dtype=torch.float32, device=self.device).view(1, -1, 1),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_one_minus_ratios",
+            torch.tensor(
+                [1.0 - r for r in ratios], dtype=torch.float32, device=self.device
+            ).view(1, -1, 1),
+            persistent=False,
+        )
+
+    def _concat_weight(self, target_layer: int) -> torch.Tensor:
+        """Per-item weights concatenated along the input axis: [target, K*L].
+
+        ``sum_i memory[:, i, :] @ W_i.T`` is exactly
+        ``memory.reshape(B, K*L) @ cat(W_i, dim=1).T`` because the contraction
+        over items and the contraction over layer_size are the same reduction.
+        Item i occupies columns [i*L, (i+1)*L), matching the row-major flatten
+        of memory's [B, K, L].
+        """
+        cache = self._weight_cache
+        if cache is not None and target_layer in cache:
+            return cache[target_layer]
+
+        weights = self.memory_weights[str(target_layer)]
+        concat = torch.cat([w for w in weights], dim=1)
+        if cache is not None:
+            cache[target_layer] = concat
+        return concat
 
     def init_memory(self, batch_size: int) -> torch.Tensor:
         """
@@ -152,17 +219,24 @@ class MemoryBank(nn.Module):
         batch_size = memory.shape[0]
 
         if self.num_items == 0:
-            return torch.zeros(batch_size, target_size, device=memory.device)
+            return torch.zeros(
+                batch_size, target_size, device=memory.device, dtype=memory.dtype
+            )
 
-        context_parts = []
-        for i in range(self.num_items):
-            # memory[:, i, :]: [B, layer_size]
-            # weights[i]:      [target_size, layer_size]
-            # result:          [B, target_size]
-            context_i = torch.matmul(memory[:, i, :], weights[i].t())
-            context_parts.append(context_i)
+        if not self.use_fused_context:
+            context_parts = []
+            for i in range(self.num_items):
+                # memory[:, i, :]: [B, layer_size]
+                # weights[i]:      [target_size, layer_size]
+                # result:          [B, target_size]
+                context_i = torch.matmul(memory[:, i, :], weights[i].t())
+                context_parts.append(context_i)
+            return torch.stack(context_parts, dim=0).sum(dim=0)
 
-        return torch.stack(context_parts, dim=0).sum(dim=0)
+        # Fused: one GEMM over the flattened items instead of K matmuls plus a
+        # stack and a sum. The item reduction becomes part of the GEMM's own
+        # inner-product reduction.
+        return F.linear(memory.reshape(batch_size, -1), self._concat_weight(target_layer))
 
     def update_memory(
         self, new_activation: torch.Tensor, memory: torch.Tensor
@@ -179,11 +253,11 @@ class MemoryBank(nn.Module):
         Returns:
             new_memory:     [B, num_items, layer_size]
         """
-        parts = []
-        for i in range(self.num_items):
-            factor = (i + 1) / self.num_items
-            parts.append(factor * new_activation + (1.0 - factor) * memory[:, i, :])
-        return torch.stack(parts, dim=1)
+        if self.num_items == 0:
+            return memory
+        return (
+            self._ratios * new_activation.unsqueeze(1) + self._one_minus_ratios * memory
+        )
 
 
 class MRNCell(nn.Module):
@@ -323,6 +397,16 @@ class MRNCell(nn.Module):
                 for layer_idx, bank in self.memory_banks.items()
             }
         )
+
+    def set_fused_context(self, enabled: bool) -> None:
+        """Toggle the fused memory-context path on every bank.
+
+        Fused (default) contracts all items of a bank in a single GEMM; the
+        loop fallback does one matmul per item. Both compute the same function
+        - the fallback exists for debugging and A/B checks.
+        """
+        for bank in self.memory_banks.values():
+            bank.use_fused_context = enabled
 
     def forward(
         self, inputs: torch.Tensor, state: Optional[MRNState] = None

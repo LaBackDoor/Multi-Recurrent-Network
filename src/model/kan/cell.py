@@ -30,7 +30,8 @@ Chain topology for deeper networks follows the existing MRN README; for 3-layer
 networks everything collapses to the canonical single hidden layer.
 """
 
-from typing import Dict, List, Optional, Tuple, NamedTuple
+from contextlib import contextmanager
+from typing import Any, Dict, Iterator, List, Optional, Tuple, NamedTuple
 
 import torch
 import torch.nn as nn
@@ -39,6 +40,23 @@ import torch.nn.functional as F
 from src.model.device import default_device
 from src.model.kan.kan_linear import KANLinear, batched_b_splines
 from src.model.kan.ratio_control import RatioControlUnit
+
+
+@contextmanager
+def sequence_kan_cache(banks: Iterator[nn.Module]) -> Iterator[None]:
+    """Hold each bank's stacked per-item KAN parameters for one sequence.
+
+    See KANMemoryBank.stacked_params. Cleared on exit so no autograd graph
+    outlives the forward that built it.
+    """
+    entered = list(banks)
+    for bank in entered:
+        bank._kan_cache = {}
+    try:
+        yield
+    finally:
+        for bank in entered:
+            bank._kan_cache = None
 
 
 class MRKANState(NamedTuple):
@@ -84,10 +102,14 @@ class KANMemoryBank(nn.Module):
     per timestep with batched ops (stacked weights, one LayerNorm kernel, one
     batched B-spline recursion, two bmms) instead of K sequential KANLinear
     calls. The per-item modules stay the single source of truth for
-    parameters - the fused path stacks them on the fly - so state_dicts,
+    parameters - the fused path stacks them into views - so state_dicts,
     pruning, shrink and per-item inspection are unaffected; outputs match the
     loop path up to fp32 kernel-order differences (~1e-6). Set
     ``use_fused_context = False`` to fall back to the per-item loop.
+
+    The stacks are loop-invariant across a sequence, so ``MRKAN.forward`` wraps
+    its timestep loop in ``sequence_kan_cache`` and builds them once. Calling a
+    bank outside that context still works; it just restacks each time.
     """
 
     def __init__(
@@ -130,6 +152,8 @@ class KANMemoryBank(nn.Module):
         self.init_memory_value = init_memory_value
         self.learn_ratios = learn_ratios
         self.use_fused_context = True
+        # Populated only inside sequence_kan_cache(); None means "rebuild".
+        self._kan_cache: Optional[Dict[int, Dict[str, Any]]] = None
         self.device = device or default_device()
 
         # Memory -> target-layer projections. One KANLinear per (target, item)
@@ -230,7 +254,9 @@ class KANMemoryBank(nn.Module):
         batch_size = memory.shape[0]
 
         if self.num_items == 0:
-            return torch.zeros(batch_size, target_size, device=memory.device)
+            return torch.zeros(
+                batch_size, target_size, device=memory.device, dtype=memory.dtype
+            )
 
         # Single-item banks keep the plain module call (bit-exact, no stacking
         # overhead); multi-item banks default to the fused batched path.
@@ -240,17 +266,99 @@ class KANMemoryBank(nn.Module):
                 parts.append(per_item[i](memory[:, i, :]))
             return torch.stack(parts, dim=0).sum(dim=0)
 
-        return self._fused_context(memory, per_item)
+        return self._fused_context(memory, target_layer)
 
-    def _fused_context(
-        self, memory: torch.Tensor, per_item: nn.ModuleList
-    ) -> torch.Tensor:
+    def _validate_item_homogeneity(self, per_item: nn.ModuleList) -> None:
+        """The fused path reads config off item 0 and applies it to all items.
+
+        That is sound for banks built by __init__ or shrink(), which give every
+        item identical (in, out, grid_size, spline_order, base_activation, LN)
+        config. It is NOT sound after hand-surgery on individual per-item
+        modules, and the failure is silent: a differing LayerNorm eps just
+        produces a quietly wrong context. Checked once per sequence, not per
+        timestep, so the cost is negligible.
+        """
+        first = per_item[0]
+        first_has_ln = first.layer_norm is not None
+        for i, m in enumerate(per_item[1:], start=1):
+            if (m.layer_norm is not None) != first_has_ln:
+                raise RuntimeError(
+                    f"fused context requires homogeneous items: item 0 "
+                    f"{'has' if first_has_ln else 'has no'} LayerNorm but item "
+                    f"{i} {'has' if not first_has_ln else 'has no'} one. "
+                    f"Set use_fused_context = False for this bank."
+                )
+            if first_has_ln and m.layer_norm.eps != first.layer_norm.eps:
+                raise RuntimeError(
+                    f"fused context requires a shared LayerNorm eps: item 0 has "
+                    f"{first.layer_norm.eps}, item {i} has {m.layer_norm.eps}."
+                )
+            if m.spline_order != first.spline_order:
+                raise RuntimeError(
+                    f"fused context requires a shared spline_order: item 0 has "
+                    f"{first.spline_order}, item {i} has {m.spline_order}."
+                )
+            # The one remaining field that would diverge silently: the fused
+            # path applies item 0's base_activation to every item's input.
+            # Compared by type because these activations are stateless modules.
+            if type(m.base_activation) is not type(first.base_activation):
+                raise RuntimeError(
+                    f"fused context requires a shared base_activation: item 0 "
+                    f"has {type(first.base_activation).__name__}, item {i} has "
+                    f"{type(m.base_activation).__name__}."
+                )
+
+    def stacked_params(self, target_layer: int) -> Dict[str, Any]:
+        """Per-item KAN parameters stacked along a leading item axis.
+
+        Loop-invariant across the timesteps of one forward: the parameters do
+        not change mid-sequence. Rebuilding these stacks every timestep is
+        ~20-33% of the fused-context path (measured), because each stack is a
+        tiny launch-bound kernel and backward then threads T separate
+        split-and-accumulate nodes into the same leaves. Built once per forward
+        under sequence_kan_cache() and reused; gradients are identical either
+        way (one stack node with T consumers accumulates the same sum).
+
+        Kept as a derived view rather than the storage format on purpose: the
+        per-item KANLinears remain the source of truth for state_dict, shrink(),
+        spline-similarity pruning and calibrate_grids' forward hooks.
+        """
+        cache = self._kan_cache
+        if cache is not None and target_layer in cache:
+            return cache[target_layer]
+
+        per_item = self.memory_kans[str(target_layer)]
+        self._validate_item_homogeneity(per_item)
+        first = per_item[0]
+        stacks = {
+            "base_w": torch.stack([m.base_weight for m in per_item]),
+            "spline_w": torch.stack([m.scaled_spline_weight for m in per_item]),
+            "grids": torch.stack([m.grid for m in per_item]),
+            "out_features": first.out_features,
+            "spline_order": first.spline_order,
+            "base_activation": first.base_activation,
+            "ln_eps": first.layer_norm.eps if first.layer_norm is not None else None,
+        }
+        if first.layer_norm is not None:
+            stacks["ln_w"] = torch.stack(
+                [m.layer_norm.weight for m in per_item]
+            ).unsqueeze(1)
+            stacks["ln_b"] = torch.stack(
+                [m.layer_norm.bias for m in per_item]
+            ).unsqueeze(1)
+
+        if cache is not None:
+            cache[target_layer] = stacks
+        return stacks
+
+    def _fused_context(self, memory: torch.Tensor, target_layer: int) -> torch.Tensor:
         """Evaluate all K item KANLinears with batched ops.
 
-        Mathematically identical to summing per_item[i](memory[:, i, :]) over
-        i; parameters are stacked on the fly so gradients flow into the same
-        per-item tensors. All items in a bank share (in, out, grid, order, LN)
-        config by construction, which is what makes the stacking valid.
+        Mathematically identical to summing per_item[i](memory[:, i, :]) over i;
+        the stacked parameters are views onto the per-item tensors, so gradients
+        land on the same leaves. All items in a bank share (in, out, grid,
+        order, LN) config, which is what makes the stacking valid; that is
+        enforced by _validate_item_homogeneity.
 
         Args:
             memory: [B, K, layer_size]
@@ -258,30 +366,22 @@ class KANMemoryBank(nn.Module):
         Returns:
             context: [B, target_size]
         """
-        first = per_item[0]
+        p = self.stacked_params(target_layer)
         x = memory.transpose(0, 1)  # [K, B, L]
 
-        if first.layer_norm is not None:
+        if p["ln_eps"] is not None:
             # One affine-free LayerNorm kernel for all items, then each
             # item's own affine params (LN weights differ per item).
-            normalized = F.layer_norm(
-                x, (self.layer_size,), eps=first.layer_norm.eps
-            )
-            ln_w = torch.stack([m.layer_norm.weight for m in per_item]).unsqueeze(1)
-            ln_b = torch.stack([m.layer_norm.bias for m in per_item]).unsqueeze(1)
-            x = normalized * ln_w + ln_b
+            normalized = F.layer_norm(x, (self.layer_size,), eps=p["ln_eps"])
+            x = normalized * p["ln_w"] + p["ln_b"]
 
-        base_w = torch.stack([m.base_weight for m in per_item])            # [K, out, in]
-        spline_w = torch.stack([m.scaled_spline_weight for m in per_item]) # [K, out, in, coeff]
-        grids = torch.stack([m.grid for m in per_item])                    # [K, in, knots]
+        base = torch.bmm(p["base_activation"](x), p["base_w"].transpose(1, 2))
 
-        base = torch.bmm(first.base_activation(x), base_w.transpose(1, 2))
-
-        bases = batched_b_splines(x, grids, first.spline_order)  # [K, B, in, coeff]
+        bases = batched_b_splines(x, p["grids"], p["spline_order"])  # [K, B, in, coeff]
         K, B = x.shape[0], x.shape[1]
         spline = torch.bmm(
             bases.reshape(K, B, -1),
-            spline_w.reshape(K, first.out_features, -1).transpose(1, 2),
+            p["spline_w"].reshape(K, p["out_features"], -1).transpose(1, 2),
         )
 
         return (base + spline).sum(dim=0)  # [B, out]

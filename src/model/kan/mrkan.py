@@ -10,7 +10,7 @@ import torch
 from torch import nn
 
 from src.model.device import default_device
-from src.model.kan.cell import MRKANCell, MRKANState
+from src.model.kan.cell import MRKANCell, MRKANState, sequence_kan_cache
 from src.model.kan.kan_linear import KANLinear
 
 
@@ -117,11 +117,14 @@ class MRKAN(nn.Module):
         outputs_values = []
         layer_activations_list = {i: [] for i in range(self.num_layers)}
 
-        for t in range(sequence_length):
-            cell_output, cell_activations, states = self.cell(inputs[:, t], states)
-            outputs_values.append(cell_output)
-            for layer_index, activation in cell_activations.items():
-                layer_activations_list[layer_index].append(activation)
+        # The per-item parameter stacks are loop-invariant; build them once for
+        # the whole sequence rather than once per timestep.
+        with sequence_kan_cache(self.cell.memory_banks.values()):
+            for t in range(sequence_length):
+                cell_output, cell_activations, states = self.cell(inputs[:, t], states)
+                outputs_values.append(cell_output)
+                for layer_index, activation in cell_activations.items():
+                    layer_activations_list[layer_index].append(activation)
 
         outputs_values = torch.stack(outputs_values, dim=1)
         all_layer_activations = {
@@ -215,10 +218,11 @@ class MRKAN(nn.Module):
                 if x.dim() == 2:
                     x = x.unsqueeze(0)
                 state = self.cell.init_state(batch_size=x.shape[0])
-                for t in range(x.shape[1]):
-                    _, _, state = self.cell(x[:, t], state)
-                    for src, mem in state.memory_banks.items():
-                        records[src].append(mem.reshape(-1, mem.shape[-1]))
+                with sequence_kan_cache(self.cell.memory_banks.values()):
+                    for t in range(x.shape[1]):
+                        _, _, state = self.cell(x[:, t], state)
+                        for src, mem in state.memory_banks.items():
+                            records[src].append(mem.reshape(-1, mem.shape[-1]))
             refs: Dict[int, torch.Tensor] = {}
             for src, rows in records.items():
                 if not rows:
@@ -440,9 +444,10 @@ class MRKAN(nn.Module):
         self.set_update_memory(True)
         self.cell.set_fused_context(False)
 
+        collected: dict[int, list[torch.Tensor]] = {}
+        hooks = []
+
         try:
-            collected: dict[int, list[torch.Tensor]] = {}
-            hooks = []
 
             def make_hook(kan_id: int):
                 def hook(module, inputs, output):
@@ -459,18 +464,23 @@ class MRKAN(nn.Module):
                     kan_modules.append(module)
                     hooks.append(module.register_forward_hook(make_hook(id(module))))
 
-            for i, batch in enumerate(dataloader):
-                if i >= n_batches:
-                    break
-                if isinstance(batch, (list, tuple)):
-                    x = batch[0]
-                else:
-                    x = batch
-                x = x.to(device)
-                self.forward(x)
-
-            for h in hooks:
-                h.remove()
+            try:
+                for i, batch in enumerate(dataloader):
+                    if i >= n_batches:
+                        break
+                    if isinstance(batch, (list, tuple)):
+                        x = batch[0]
+                    else:
+                        x = batch
+                    x = x.to(device)
+                    self.forward(x)
+            finally:
+                # Must run even if a batch raises. A leaked forward hook keeps
+                # appending activations into `collected` on every subsequent
+                # training forward -- an invisible, unbounded memory leak.
+                for h in hooks:
+                    h.remove()
+                hooks.clear()
 
             for module in kan_modules:
                 samples = collected.get(id(module), [])
@@ -481,6 +491,8 @@ class MRKAN(nn.Module):
                 # already reshaped to that.
                 module.update_grid(x)
         finally:
+            for h in hooks:  # no-op on the success path; safety net if the
+                h.remove()  # hook registration loop itself raised
             self.set_update_memory(prev_update_memory)
             for key, bank in self.cell.memory_banks.items():
                 bank.use_fused_context = prev_fused[key]

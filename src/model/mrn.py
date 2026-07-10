@@ -5,7 +5,7 @@ from typing import List, Optional, Tuple, Union
 import torch
 from torch import nn
 
-from src.model.cell import MRNCell, MRNState
+from src.model.cell import MRNCell, MRNState, sequence_weight_cache
 from src.model.device import default_device
 
 
@@ -100,11 +100,14 @@ class MRN(nn.Module):
         outputs_values = []
         layer_activations_list = {i: [] for i in range(self.num_layers)}
 
-        for t in range(sequence_length):
-            cell_output, cell_activations, states = self.cell(inputs[:, t], states)
-            outputs_values.append(cell_output)
-            for layer_index, activation in cell_activations.items():
-                layer_activations_list[layer_index].append(activation)
+        # The per-item weight concat is loop-invariant; build it once for the
+        # whole sequence rather than once per timestep.
+        with sequence_weight_cache(self.cell.memory_banks.values()):
+            for t in range(sequence_length):
+                cell_output, cell_activations, states = self.cell(inputs[:, t], states)
+                outputs_values.append(cell_output)
+                for layer_index, activation in cell_activations.items():
+                    layer_activations_list[layer_index].append(activation)
 
         outputs_values = torch.stack(outputs_values, dim=1)
         all_layer_activations = {
@@ -137,3 +140,9 @@ class MRN(nn.Module):
     def set_update_memory(self, update: bool):
         """Enable or disable memory updates during forward passes."""
         self.cell._update_memory_flag = update
+
+    def set_fused_context(self, enabled: bool) -> None:
+        """Toggle the fused memory-context path on every bank.
+
+        See MRNCell.set_fused_context."""
+        self.cell.set_fused_context(enabled)

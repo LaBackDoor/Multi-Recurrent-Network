@@ -758,7 +758,13 @@ class MRKANCell(nn.Module):
         target_layer = self._chain_target(0)
         batch_size, seq_len, _ = inputs.shape
 
-        if initial_memory.shape[0] != batch_size:
+        # A [1, K, L] state against a batch-B input works under frozen memory
+        # (set_update_memory(False)), where nothing calls update_memory's
+        # expand_as. torch.stack below would not broadcast, so do it explicitly
+        # rather than regressing that case.
+        if initial_memory.shape[0] == 1 and batch_size != 1:
+            initial_memory = initial_memory.expand(batch_size, -1, -1)
+        elif initial_memory.shape[0] != batch_size:
             raise ValueError(
                 f"initial memory has batch {initial_memory.shape[0]} but inputs "
                 f"have batch {batch_size}; pass a state built for this batch size."
@@ -829,7 +835,11 @@ class MRKANCell(nn.Module):
                         )
                         context_parts.append(bank_context)
                 if context_parts:
-                    context = torch.stack(context_parts, dim=0).sum(dim=0)
+                    # sum(), not stack().sum(0): a [1, K, L] initial state makes
+                    # the precomputed layer-0 context [B, size] while the other
+                    # banks' in-loop contexts stay [1, size], and stack demands
+                    # equal shapes. Bit-exact with stack().sum(0) when they match.
+                    context = sum(context_parts)
                     activation_pre = activation_pre + context
 
             if layer_idx == self.num_layers - 1:

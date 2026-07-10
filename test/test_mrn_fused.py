@@ -255,8 +255,18 @@ def test_precompute_respects_frozen_memory():
 def test_precompute_gradients_reach_inputs_and_initial_memory():
     """Parameter grads alone would not catch a double-counted EMA: the
     precomputed trajectory and the in-loop one are both functions of (M_0,
-    inputs). Check the grads that would double if they were counted twice."""
+    inputs). Check the grads that would double if they were counted twice.
+
+    The layer-0 projection is scaled up first. At the default init the context
+    path contributes ~2e-6 of the relative input gradient, so this test would
+    pass even if the precomputed context were fully detached -- it has to carry
+    an O(1) share of the gradient to discriminate anything.
+    """
     model = _build([4, 8, 3], [2, 2, 0])
+    with torch.no_grad():
+        for per_item in model.cell.memory_banks["0"].memory_weights.values():
+            for w in per_item:
+                w.mul_(50.0)
     x0 = torch.randn(3, 6, 4)
     state0 = model.init_state(3)
 
@@ -323,10 +333,16 @@ def test_precompute_falls_back_when_state_omits_the_input_bank():
     torch.testing.assert_close(pre, loop, rtol=1e-6, atol=1e-6)
 
 
-def test_precompute_preserves_batch_one_state_broadcast():
+@pytest.mark.parametrize("memory_structure", [[2, 0, 0], [2, 2, 0], [2, 2, 1]])
+def test_precompute_preserves_batch_one_state_broadcast(memory_structure):
     """MRN's update_memory broadcasts, so a [1, K, L] state against a batch-B
-    input used to work. torch.stack would not."""
-    model = _build([3, 6, 2], [2, 0, 0])
+    input used to work.
+
+    With more than one bank this is where the precompute bites: the hoisted
+    layer-0 context is [B, size] while the other banks' in-loop contexts are
+    still [1, size], so summing them must broadcast rather than stack.
+    """
+    model = _build([3, 6, 2], memory_structure)
     x = torch.randn(5, 4, 3)
     state = model.init_state(1)
 

@@ -25,20 +25,28 @@ pre-optimization baseline: per-item context loop, no hoist, no precompute.
 
 ## Results (RTX 4060, torch 2.9.1+cu130)
 
-`covid` config: `nn=[1,16,32,1]`, `mem=[4,3,2,4]`, B=32, T=14. Speedup vs the eager
-per-item loop (`loop, eager`), same fwd / fwd+bwd column.
+`covid` config: `nn=[1,16,32,1]`, `mem=[4,3,2,4]`, B=32, T=14. Median ms, one sweep.
 
 | variant | MR-KAN fwd | MR-KAN fwd+bwd | MRN fwd | MRN fwd+bwd |
 | --- | --- | --- | --- | --- |
-| loop, eager | 1.0× (103.7 ms) | 1.0× (248.4 ms) | 1.0× (11.5 ms) | 1.0× (30.9 ms) |
-| fused, eager | 3.4× | 3.6× | 1.7× | 1.8× |
-| fused, `compile(cell)` | 12.5× | 11.5× | 2.2× | 1.5× |
-| fused, `compile(cell, reduce-overhead)` | *raises* | 23.0× | *raises* | 3.0× |
-| fused, `compile(model)` | 13.4× | 11.6× | 4.2× | 4.2× |
-| **fused, `compile(model, reduce-overhead)`** | **72.0×** | **80.5×** | **23.1×** | **15.1×** |
+| loop, eager (baseline) | 104.1 | 211.3 | 15.3 | 31.3 |
+| fused, eager | 30.6 | 67.3 | 6.6 | 18.0 |
+| fused, `compile(cell)` | 8.0 | 26.8 | 5.0 | 15.5 |
+| fused, `compile(cell, reduce-overhead)` | *raises* | 13.8 | *raises* | 8.8 |
+| fused, `compile(model)` | 7.6 | 20.5 | 2.7 | 11.0 |
+| **fused, `compile(model, reduce-overhead)`** | **2.3** | **4.1** | **0.52** | **2.1** |
+
+Roughly: hand-fusion ~3× (MR-KAN) / ~1.8× (MRN); `compile(cell)` on top of that another ~2.5×;
+whole-sequence capture another ~5×. End to end **~50× (MR-KAN) and ~15× (MRN) on fwd+bwd**.
+
+**Quote the absolute compiled times, not the multipliers.** The compiled rows reproduce to ~1%,
+but the *eager baselines* drift across sessions: MR-KAN's `fwd+bwd loop eager` measured 211,
+248 and 209 ms on three different days, and one MRN repeat jumped 30.2 → 44.3 ms. Any speedup
+computed against them inherits that ±20–40%. Treat the ratios as indicative.
 
 At the `ett` config (`nn=[7,64,64,1]`, `mem=[4,4,4,4]`, B=32, T=96) whole-model compile is
-skipped by default; MR-KAN `fused + compile(cell, reduce-overhead)` reaches **58.9×** fwd+bwd.
+skipped by default; MR-KAN `fused + compile(cell, reduce-overhead)` runs fwd+bwd in 68 ms
+against a ~4.0 s eager loop.
 
 The `nopre` variant isolates `precompute_input_context` (the layer-0 hoist). It is a real win
 for MR-KAN — 1.45× (covid fwd) and a repeated-measurement 1.2× (ett, both directions) — because
@@ -60,20 +68,27 @@ rather than a tight `step(); step()` loop. Verdict: **yes, with two rules.**
 
 | scenario | result |
 | --- | --- |
-| 25 AdamW steps, loss + final params vs eager | identical (max loss diff 6e-8, param diff 5e-5) |
+| 25 AdamW steps, loss + final params vs eager | identical (max loss diff 3e-8, param diff 1e-5) |
+| gradient accumulation (4 backwards, 1 step) | raises unless `p.grad` is cloned each backward; exact once it is |
 | train / `no_grad` validation interleaved | works |
 | ragged final batch (`drop_last=False`) | works; recompiles once (2 graphs) |
 | `calibrate_grids` between epochs | works |
-| per training step (fwd+bwd+AdamW) | 119.0 ms → 8.5 ms (**13.9×**), peak 23 → 17 MiB |
+| per training step (fwd+bwd+AdamW) | ~10–18× faster than eager, peak 23 → 17 MiB |
 
 The two rules:
 
 1. **Pass `states=` explicitly.** `states=None` pulls `init_state()`'s `torch.rand` into the
    graph, where inductor draws from its own RNG. Same seed, different initial memory
    (measured 3.1e-3 output difference) — which looks exactly like a numerics bug and is not one.
-2. **`clone()` any output you keep across steps.** Graph replay writes into static buffers;
-   retaining last step's output and reading it after the next step raises
-   `accessing tensor output of CUDAGraphs that has been overwritten`. Detaching is not enough.
+2. **`clone()` anything you keep across steps — including `p.grad`.** Graph replay writes into
+   static buffers. Retaining last step's output and reading it after the next step raises
+   `accessing tensor output of CUDAGraphs that has been overwritten`; `detach()` is not enough,
+   because it shares storage. Gradients are outputs of the captured *backward*, so micro-batch
+   accumulation hits the same wall: without `p.grad = p.grad.clone()` after each backward it
+   raises at `opt.step()`; with it, the accumulated gradients match eager to 1.2e-7.
+
+Both failures are loud. We could not construct a case where graph capture silently produced
+wrong gradients in an ordinary loop.
 
 `T` is pinned by the capture, and a batch-size change costs one recompile. Both are fine for a
 fixed-window trainer. Throughput above is a *lower bound*: the probe must disable inductor's

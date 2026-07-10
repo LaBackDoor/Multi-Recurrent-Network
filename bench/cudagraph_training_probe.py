@@ -158,6 +158,57 @@ def scenario_retained_output_is_overwritten():
         return True  # informative either way; not a failure of the approach
 
 
+def _accumulate(model, micro, clone_grads: bool):
+    state = model.init_state(B)
+    model.zero_grad(set_to_none=True)
+    for x, y in micro:
+        out = model(x, states=state.clone(), return_sequences=False)
+        (torch.nn.functional.mse_loss(out, y) / len(micro)).backward()
+        if clone_grads:
+            # .grad is an output of the captured backward, living in a static
+            # buffer the next micro-batch's replay overwrites. Accumulating
+            # across replays means keeping it, so it has to be copied out.
+            for p in model.parameters():
+                if p.grad is not None:
+                    p.grad = p.grad.clone()
+    return {n: p.grad.clone() for n, p in model.named_parameters()}
+
+
+def scenario_gradient_accumulation():
+    """Several backwards before one optimizer step -- micro-batching.
+
+    Gradients are outputs of the captured backward, so the retained-output rule
+    applies to them too: accumulating across replays without copying `.grad` out
+    reads a buffer the next replay has overwritten. It raises rather than
+    corrupting silently, and copying `.grad` after each backward makes it exact.
+    """
+    micro = _data(4)
+    eager = _accumulate(_build(False), micro, clone_grads=False)
+    scale = max(g.abs().max().item() for g in eager.values())
+
+    outcomes = {}
+    for label, clone in (("no .grad clone", False), (".grad cloned", True)):
+        try:
+            graph = _accumulate(_build(True), micro, clone_grads=clone)
+        except RuntimeError:
+            outcomes[label] = ("RAISES", "read of an overwritten grad buffer")
+            continue
+        worst = max((eager[n] - graph[n]).abs().max().item() for n in eager)
+        clean = worst < 1e-5 * max(scale, 1.0)
+        outcomes[label] = ("matches" if clean else "SILENTLY WRONG", f"{worst:.3e}")
+
+    for label, (verdict, detail) in outcomes.items():
+        print(f"  4 backwards then 1 step [{label:15s}]: {verdict}  ({detail})")
+    print(f"    eager grad scale {scale:.3e}")
+
+    ok = outcomes[".grad cloned"][0] == "matches"
+    if not ok:
+        print("    -> do not accumulate under reduce-overhead")
+    elif outcomes["no .grad clone"][0] != "matches":
+        print("    -> accumulation works, but you must clone p.grad each backward")
+    return ok
+
+
 def scenario_interleaved_validation():
     """Training steps interleaved with no_grad validation, as every real loop does.
     Forward-only under a captured graph is where the cell-level variant died."""
@@ -291,6 +342,7 @@ def main() -> None:
     print(f"model nn={NN} mem={MEM} B={B} T={T}\n")
     scenarios = [
         ("loss parity", scenario_loss_parity),
+        ("gradient accumulation", scenario_gradient_accumulation),
         ("retained outputs", scenario_retained_output_is_overwritten),
         ("interleaved validation", scenario_interleaved_validation),
         ("ragged last batch", scenario_ragged_last_batch),

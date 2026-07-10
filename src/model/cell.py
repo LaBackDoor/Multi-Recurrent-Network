@@ -573,7 +573,11 @@ class MRNCell(nn.Module):
                         context_parts.append(bank_context)
 
                 if context_parts:
-                    context = torch.stack(context_parts, dim=0).sum(dim=0)
+                    # sum(), not stack().sum(0): a [1, K, L] initial state makes
+                    # the precomputed layer-0 context [B, size] while the other
+                    # banks' in-loop contexts stay [1, size], and stack demands
+                    # equal shapes. Bit-exact with stack().sum(0) when they match.
+                    context = sum(context_parts)
                     activation_pre = activation_pre + context
 
             if layer_idx == self.num_layers - 1:

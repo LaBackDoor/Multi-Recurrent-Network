@@ -438,12 +438,32 @@ def test_precompute_falls_back_when_state_omits_the_input_bank():
     torch.testing.assert_close(pre, loop, rtol=1e-5, atol=1e-6)
 
 
+@pytest.mark.parametrize("memory_structure", [[2, 0, 0], [2, 2, 0]])
+def test_precompute_preserves_frozen_memory_batch_one_broadcast(memory_structure):
+    """Under set_update_memory(False) nothing calls update_memory's expand_as, so
+    a [1, K, L] state against a batch-B input used to work. With >1 bank the
+    hoisted layer-0 context is [B, size] while the others stay [1, size]."""
+    torch.manual_seed(0)
+    model = MRKAN([3, 8, 1], memory_structure, device=torch.device("cpu"))
+    model.set_update_memory(False)
+    x = torch.rand(5, 4, 3)
+    state = model.init_state(1)
+
+    model.set_precompute_input_context(False)
+    loop = model(x, states=state.clone())
+    model.set_precompute_input_context(True)
+    pre = model(x, states=state.clone())
+    assert pre.shape == (5, 4, 1)
+    torch.testing.assert_close(pre, loop, rtol=1e-5, atol=1e-6)
+
+
 def test_precompute_rejects_a_batch_mismatched_state():
+    """A genuinely mismatched batch (not the broadcastable 1) must be legible."""
     torch.manual_seed(0)
     model = MRKAN([3, 8, 1], [2, 0, 0], device=torch.device("cpu"))
     x = torch.rand(5, 4, 3)
     with pytest.raises(ValueError, match="batch"):
-        model.cell.precompute_input_context(x, model.init_state(1).memory_banks[0])
+        model.cell.precompute_input_context(x, model.init_state(3).memory_banks[0])
 
 
 def test_precompute_matches_loop_under_chunked_streaming():
